@@ -13,17 +13,18 @@
 # limitations under the License.
 
 import json
-import pytest
+import math
 import unittest
+
+import pytest
 import torch
 import torch.nn.functional as F
-from torch.profiler import profile, ProfilerActivity, _memory_profiler
+from torch.profiler import ProfilerActivity, _memory_profiler, profile
 from torch.testing._internal.common_utils import (
-    skipIfTorchDynamo,
     TemporaryFileName,
     TestCase,
+    skipIfTorchDynamo,
 )
-
 
 Test_spyre = None
 if hasattr(torch, "spyre"):
@@ -157,7 +158,7 @@ def test_chrome_trace_is_valid_json(tmp_path):
     Verify that export_chrome_trace() produces valid JSON with at least one event.
     """
     import torch
-    from torch.profiler import profile, ProfilerActivity
+    from torch.profiler import ProfilerActivity, profile
 
     trace_file = tmp_path / "spyre_trace.json"
 
@@ -366,3 +367,167 @@ class TestMemoryProfilerTimeline(TestCase):
 
         for event in expected:
             self.assertTrue(event in actual, f"event: {event} was not found in actual.")
+
+
+def _find_kernel_overlaps(events):
+    """Return valid positive-duration kernel events and any overlapping event pairs."""
+    kernel_events = []
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("ph") != "X" or event.get("cat") != "kernel":
+            continue
+
+        timestamp = event.get("ts")
+        duration = event.get("dur")
+        name = event.get("name", "unknown")
+
+        assert (
+            isinstance(timestamp, (int, float))
+            and not isinstance(timestamp, bool)
+            and math.isfinite(timestamp)
+        ), (
+            f"Kernel event {name} must have a finite numeric timestamp "
+            f"(ts={timestamp}, dur={duration})"
+        )
+
+        assert (
+            isinstance(duration, (int, float))
+            and not isinstance(duration, bool)
+            and math.isfinite(duration)
+            and duration > 0
+        ), (
+            f"Kernel event {name} must have a finite positive duration "
+            f"(ts={timestamp}, dur={duration})"
+        )
+
+        kernel_events.append(event)
+
+    sorted_events = sorted(kernel_events, key=lambda event: event["ts"])
+    overlaps = []
+
+    # Check overlaps on the global kernel timeline for now.
+    # Per-stream scoping is deferred until stream IDs in the trace are confirmed.
+    for first_index, first_event in enumerate(sorted_events):
+        first_end_time = first_event["ts"] + first_event["dur"]
+
+        for second_event in sorted_events[first_index + 1 :]:
+            if second_event["ts"] >= first_end_time:
+                break
+            overlaps.append((first_event, second_event))
+
+    return sorted_events, overlaps
+
+
+def test_find_kernel_overlaps():
+    """Verify overlap detection with simple synthetic kernel events."""
+    clean_events = [
+        {"ph": "X", "cat": "kernel", "name": "kernel_1", "ts": 0, "dur": 10},
+        {"ph": "X", "cat": "kernel", "name": "kernel_2", "ts": 10, "dur": 10},
+    ]
+
+    overlap_events = [
+        {"ph": "X", "cat": "kernel", "name": "kernel_1", "ts": 0, "dur": 10},
+        {"ph": "X", "cat": "kernel", "name": "kernel_2", "ts": 5, "dur": 10},
+    ]
+
+    clean_kernels, clean_overlaps = _find_kernel_overlaps(clean_events)
+    overlap_kernels, overlaps = _find_kernel_overlaps(overlap_events)
+
+    assert len(clean_kernels) == 2
+    assert clean_overlaps == []
+
+    assert len(overlap_kernels) == 2
+    assert len(overlaps) == 1
+
+    first_event, second_event = overlaps[0]
+    assert first_event["name"] == "kernel_1"
+    assert second_event["name"] == "kernel_2"
+
+    first_end_time = first_event["ts"] + first_event["dur"]
+    second_end_time = second_event["ts"] + second_event["dur"]
+    overlap_time = min(first_end_time, second_end_time) - second_event["ts"]
+    assert overlap_time == 5
+
+
+def test_find_kernel_overlaps_invalid_events():
+    """Verify invalid kernel interval data is rejected."""
+    zero_duration_event = [
+        {"ph": "X", "cat": "kernel", "name": "kernel_zero", "ts": 0, "dur": 0}
+    ]
+
+    missing_timestamp_event = [
+        {"ph": "X", "cat": "kernel", "name": "kernel_missing_ts", "dur": 10}
+    ]
+
+    missing_duration_event = [
+        {"ph": "X", "cat": "kernel", "name": "kernel_missing_dur", "ts": 0}
+    ]
+
+    with pytest.raises(AssertionError):
+        _find_kernel_overlaps(zero_duration_event)
+
+    with pytest.raises(AssertionError):
+        _find_kernel_overlaps(missing_timestamp_event)
+
+    with pytest.raises(AssertionError):
+        _find_kernel_overlaps(missing_duration_event)
+
+
+@pytest.mark.requires_spyre_profiler
+def test_kernel_time_overlap(tmp_path):
+    """Verify kernel intervals are valid and compute kernel events do not overlap."""
+    trace_file = tmp_path / "kernel_overlap_trace.json"
+
+    x = torch.randn((64, 64), dtype=torch.float16, device="spyre")
+    y = torch.randn((64, 64), dtype=torch.float16, device="spyre")
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        result = torch.matmul(x, y)
+        result = F.gelu(result)
+        result = torch.sum(result)
+        torch.spyre.synchronize()
+
+    prof.export_chrome_trace(str(trace_file))
+
+    assert trace_file.exists(), "Chrome trace file was not created"
+
+    with trace_file.open("r", encoding="utf-8") as trace:
+        trace_data = json.load(trace)
+
+    assert isinstance(trace_data, dict), "Trace JSON must be a dictionary"
+    assert "traceEvents" in trace_data, "Chrome trace is missing the 'traceEvents' key"
+
+    trace_events = trace_data["traceEvents"]
+    assert isinstance(trace_events, list), "'traceEvents' must contain a list"
+
+    kernel_events, overlaps = _find_kernel_overlaps(trace_events)
+
+    assert len(kernel_events) >= 2, (
+        "Expected at least two compute kernel events for overlap validation"
+    )
+
+    if overlaps:
+        overlap_details = []
+
+        for first_event, second_event in overlaps[:10]:
+            first_end_time = first_event["ts"] + first_event["dur"]
+            second_end_time = second_event["ts"] + second_event["dur"]
+
+            overlap_start = max(first_event["ts"], second_event["ts"])
+            overlap_end = min(first_end_time, second_end_time)
+            overlap_time = overlap_end - overlap_start
+
+            overlap_details.append(
+                f"{first_event.get('name', 'unknown')} overlaps "
+                f"{second_event.get('name', 'unknown')} by "
+                f"{overlap_time:.3f} trace time units"
+            )
+
+        pytest.fail(
+            f"{len(overlaps)} kernel time overlap(s) detected:\n"
+            + "\n".join(overlap_details)
+        )
