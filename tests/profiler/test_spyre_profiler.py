@@ -450,9 +450,15 @@ def test_find_kernel_overlaps():
     assert first_event["name"] == "kernel_1"
     assert second_event["name"] == "kernel_2"
 
-    first_end_time = first_event["ts"] + first_event["dur"]
-    second_end_time = second_event["ts"] + second_event["dur"]
-    overlap_time = min(first_end_time, second_end_time) - second_event["ts"]
+    first_start_time = first_event["ts"]
+    second_start_time = second_event["ts"]
+    first_end_time = first_start_time + first_event["dur"]
+    second_end_time = second_start_time + second_event["dur"]
+
+    overlap_start = max(first_start_time, second_start_time)
+    overlap_end = min(first_end_time, second_end_time)
+    overlap_time = overlap_end - overlap_start
+
     assert overlap_time == 5
 
 
@@ -482,7 +488,7 @@ def test_find_kernel_overlaps_invalid_events():
 
 @pytest.mark.requires_spyre_profiler
 def test_kernel_time_overlap(tmp_path):
-    """Verify kernel intervals are valid and compute kernel events do not overlap."""
+    """Reject non-finite timestamps or non-positive durations, then verify no overlaps."""
     trace_file = tmp_path / "kernel_overlap_trace.json"
 
     x = torch.randn((64, 64), dtype=torch.float16, device="spyre")
@@ -527,8 +533,10 @@ def test_kernel_time_overlap(tmp_path):
             overlap_time = overlap_end - overlap_start
 
             overlap_details.append(
-                f"{first_event.get('name', 'unknown')} overlaps "
-                f"{second_event.get('name', 'unknown')} by "
+                f"{first_event.get('name', 'unknown')} "
+                f"(ts={first_event['ts']}, dur={first_event['dur']}, end={first_end_time}) overlaps "
+                f"{second_event.get('name', 'unknown')} "
+                f"(ts={second_event['ts']}, dur={second_event['dur']}, end={second_end_time}) by "
                 f"{overlap_time:.3f} trace time units"
             )
 
