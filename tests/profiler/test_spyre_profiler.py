@@ -409,6 +409,11 @@ def _find_kernel_overlaps(events):
 
     # Check overlaps on the global kernel timeline for now.
     # Per-stream scoping is deferred until stream IDs in the trace are confirmed.
+    # AIU kernel events are currently expected to represent independent execution
+    # intervals rather than nested parent-child function calls. Therefore, fully
+    # nested kernel spans are intentionally treated as overlaps. If nested
+    # parent-child kernel execution becomes valid in the future, this validation
+    # should be revisited.
     for first_index, first_event in enumerate(sorted_events):
         first_end_time = first_event["ts"] + first_event["dur"]
 
