@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import tempfile
+from typing import Any, cast
 from collections.abc import Sequence
 import os
 import subprocess
@@ -27,6 +28,9 @@ from torch_spyre._inductor.op_spec import (
     OpSpec,
     UnimplementedOp,
     find_unimplemented,
+)
+from torch_spyre._inductor.kernel_provenance import (
+    build_kernel_provenance_descriptor,
 )
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from torch_spyre.profiler._ffdc import CATEGORY_COMPILE, try_collect
@@ -55,6 +59,11 @@ class SpyreAsyncCompile(AsyncCompile):
 
     """
 
+    def __init__(self):
+        super().__init__()
+        self._provenance_attempt_count = 0
+        self._provenance_failure_count = 0
+
     def triton(self, *args, **kwargs):
         raise NotImplementedError(
             "SpyreAsyncCompile does not support Triton kernels; only "
@@ -81,6 +90,29 @@ class SpyreAsyncCompile(AsyncCompile):
         output_dir = get_output_dir(kernel_name)
         generate_bundle(kernel_name, output_dir, specs)
 
+        self._provenance_attempt_count += 1
+        try:
+            # This is the common fresh-compile/cache-reload boundary: generated
+            # wrappers have reconstructed the finalized OpSpecs before calling
+            # sdsc(). Derive the transport-neutral identity here without changing
+            # the generated wrapper call ABI.
+            finalized_specs = cast(Sequence[OpSpec | LoopSpec], specs)
+            kernel_provenance = build_kernel_provenance_descriptor(finalized_specs)
+        except Exception:  # noqa: BLE001 - provenance must never fail the build
+            # Keep canonicalization strict rather than issuing an ambiguous
+            # fallback key. Log the first traceback, then report the complete
+            # failure count at the generated wrapper's wait() boundary.
+            self._provenance_failure_count += 1
+            if self._provenance_failure_count == 1:
+                logger.warning(
+                    "kernel provenance descriptor construction failed for kernel "
+                    "%s; continuing without kernel provenance; additional "
+                    "failures in this compilation will be summarized",
+                    kernel_name,
+                    exc_info=True,
+                )
+            kernel_provenance = None
+
         # Invoke backend compiler of SDSC Bundle
         with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
             try:
@@ -95,4 +127,55 @@ class SpyreAsyncCompile(AsyncCompile):
                 )
                 raise
 
-        return SpyreSDSCKernelRunner(kernel_name, output_dir)
+        return SpyreSDSCKernelRunner(
+            kernel_name,
+            output_dir,
+            kernel_provenance=kernel_provenance,
+        )
+
+    def ktir(
+        self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
+    ):
+        """Emit KTDP-dialect MLIR for ``specs`` (OpSpec->KTIR path).
+
+        Mirrors ``sdsc`` but emits KTIR directly instead of an SDSC bundle.
+        Device execution is not wired yet: the emitted KTIR is persisted to
+        disk for inspection and this raises ``NotImplementedError``.
+        """
+        unimp = find_unimplemented(list(specs))
+        if unimp is not None:
+            logger.warning(
+                f"WARNING: Compiling unimplemented {unimp.op} to runtime exception"
+            )
+            return SpyreUnimplementedRunner(kernel_name, unimp.op)
+
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        # Emit before opening the file: if generate_ktir raises we must not
+        # leave a truncated/empty .ktir behind.
+        ktir_text = generate_ktir(kernel_name, specs)
+
+        # Persist the emitted KTIR as a text file in the same per-kernel output
+        # dir as sdsc's bundle.
+        output_dir = get_output_dir(kernel_name)
+        ktir_path = os.path.join(output_dir, f"{kernel_name}.ktir")
+        with open(ktir_path, "w") as fh:
+            fh.write(ktir_text)
+        logger.debug("OpSpec->KTIR: wrote %s", ktir_path)
+
+        raise NotImplementedError(
+            "OpSpec->KTIR: device execution is not wired yet; the emitted KTIR "
+            f"was written to {ktir_path} for inspection. Execution lands in a "
+            "later PR."
+        )
+
+    def wait(self, scope: dict[str, Any]) -> None:
+        super().wait(scope)
+        if self._provenance_failure_count:
+            logger.warning(
+                "kernel provenance disabled for %d/%d compiled Spyre kernels",
+                self._provenance_failure_count,
+                self._provenance_attempt_count,
+            )
+        self._provenance_attempt_count = 0
+        self._provenance_failure_count = 0

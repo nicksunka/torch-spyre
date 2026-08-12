@@ -34,11 +34,14 @@ import torch._decomp as decomp
 
 from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from .errors import Unsupported
+from .logging_utils import get_inductor_logger
 
 from . import customops  # noqa: F401
 from . import spyre_hint
 from torch_spyre._C import DataFormats, get_device_dtype
 import torch_spyre._inductor.customops  # noqa: F401
+
+logger = get_inductor_logger("decompositions")
 
 
 # Determine the float dtype for bool at module load time (not during tracing)
@@ -348,7 +351,15 @@ def spyre_gelu(
 def spyre_softplus(
     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
 ) -> torch.Tensor:
-    return torch.ops.spyre.softplus(input, beta, threshold)
+    if beta == 1.0:
+        return torch.ops.spyre.softplus(input, beta, threshold)
+    # The runtime primitive drops the outer 1/beta factor, so beta == 1 is its
+    # only exact path. Scale into it and back out; the threshold branch stays
+    # exact because 1 * (beta * x) > threshold is PyTorch's beta * x > threshold.
+    # aten accepts beta == 0 and saturates every element to +-inf, so take the
+    # reciprocal under IEEE rules rather than letting Python raise here.
+    inv_beta = math.copysign(math.inf, beta) if beta == 0.0 else 1.0 / beta
+    return torch.ops.spyre.softplus(input * beta, 1.0, threshold) * inv_beta
 
 
 @register_spyre_decompositions([torch.ops.aten.linear.default])
@@ -696,6 +707,7 @@ def conv2d_via_bmm_decomp(
     Decompose 2D convolution into batch matrix multiplication using torch.nn.unfold.
     torch.nn.unfold directly returns (N, C_in * K_h * K_w, H_out * W_out), avoiding
     intermediate reshape/view/unsqueeze operations.
+    For depthwise convolutions (C_in = groups = C_out), invoke torch.spyre.conv2d directly.
     """
     if transposed:
         raise Unsupported("conv2d_via_bmm: transposed convolution not supported")
@@ -708,6 +720,12 @@ def conv2d_via_bmm_decomp(
 
     N, C_in, H_in, W_in = input.shape
     C_out, C_in_per_group, K_h, K_w = weight.shape
+
+    # For depthwise convolutions (C_in = groups = C_out), use torch.spyre.conv2d_with_bias
+    if C_in == groups == C_out:
+        return torch.ops.spyre.conv2d_with_bias(
+            input, weight, bias, stride, padding, dilation, groups
+        )
 
     stride_h, stride_w = stride[0], stride[1]
     pad_h, pad_w = padding[0], padding[1]
@@ -766,6 +784,39 @@ def conv2d_via_bmm_decomp(
     return output
 
 
+@register_spyre_decompositions([torch.ops.spyre.conv2d_with_bias.default])
+def spyre_conv2d_with_bias_decomp(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    groups: int,
+) -> torch.Tensor:
+    """
+    Decompose torch.ops.spyre.conv2d_with_bias into:
+      1. torch.ops.spyre.conv2d without bias
+      2. Expand bias to (N, C_out, H_out, W_out) for broadcasting
+      3. Add the bias to the output
+
+    This keeps the spyre.conv2d lowering simple while supporting conv2d with bias.
+    """
+    # Call spyre.conv2d without bias
+    output = torch.ops.spyre.conv2d(input, weight, stride, padding, dilation, groups)
+
+    # If bias is present, add it
+    if bias is not None:
+        # Get output shape
+        N, C_out, H_out, W_out = output.shape
+        # Reshape bias to (1, C_out, 1, 1) then expand to (N, C_out, H_out, W_out)
+        # This avoids stick layout issues by expanding before adding
+        bias_expanded = bias.reshape(1, C_out, 1, 1).expand(N, C_out, H_out, W_out)
+        output = output + bias_expanded
+
+    return output
+
+
 # Register decomposition for custom spyre op (not aten, so use decomp.register_decomposition directly)
 @register_spyre_decompositions([torch.ops.spyre.dequantize_fp8_with_scale])
 def dequantize_fp8_with_scale_decomp(
@@ -781,6 +832,46 @@ def dequantize_fp8_with_scale_decomp(
     """
     x_fp16 = input.to(torch.float16)
     return x_fp16 * scale
+
+
+@register_spyre_decompositions([torch.ops.aten._scaled_mm.default])
+def scaled_mm_decomp(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    scale_a: torch.Tensor = None,
+    scale_b: torch.Tensor = None,
+    bias: torch.Tensor = None,
+    scale_result: torch.Tensor = None,
+    out_dtype: torch.dtype = None,
+    use_fast_accum: bool = False,
+) -> torch.Tensor:
+    """
+    Decompose _scaled_mm into:
+    1. Raw FP8 matmul via spyre.scaled_mm (no scale/bias applied)
+    2. Multiply by scale_a, if present
+    3. Multiply by scale_b, if present
+    4. Add bias, if present
+
+    This decomposition is executed during compilation and keeps scale/bias
+    arithmetic out of lower_scaled_mm's matmul lowering - the same
+    separation dequantize_fp8_with_scale_decomp uses for its FP8->FP16
+    conversion.
+    """
+    result = torch.ops.spyre.scaled_mm(mat1, mat2, out_dtype=out_dtype)
+
+    if scale_a is not None:
+        result = result * scale_a
+    if scale_b is not None:
+        result = result * scale_b
+    if bias is not None:
+        result = result + bias
+
+    if scale_result is not None:
+        logger.warning("scale_result parameter in _scaled_mm is not yet supported")
+    if use_fast_accum:
+        logger.warning("use_fast_accum parameter in _scaled_mm is not yet supported")
+
+    return result
 
 
 @register_spyre_decompositions([torch.ops.aten.where.ScalarOther])
@@ -906,3 +997,112 @@ def spyre_prod_dim_int(
         acc = acc.unsqueeze(dim)
 
     return acc
+
+
+def _masked_scatter_reject_reason(
+    self: torch.Tensor,
+    mask: torch.Tensor,
+    source: torch.Tensor,
+) -> Optional[str]:
+    """Why ``masked_scatter`` cannot use the row-level path here, or ``None`` if it can.
+
+    The mask must select whole rows: constant across the last (column) dim, with
+    every other dim matching ``self`` so there is exactly one mask bool per row.
+    That covers both spellings PyTorch may hand us for a row-broadcast mask, which
+    the body collapses identically via ``mask[..., 0]``:
+      * un-expanded -- the last dim is literally ``1`` (e.g. ``[B, S, 1]``); or
+      * expanded    -- the last dim is ``cols`` but broadcast (``stride(-1) == 0``).
+
+    Checks are ordered cheapest/most-general to most-specific:
+      1. Rank guards (no device_layout access needed).
+      2. Leading-dim equality (one mask entry per row).
+      3. Degenerate column guard (cols <= 1 is not a meaningful row).
+      4. Source column alignment.
+      5. Per-row last-dim check (the structural row-level requirement).
+    """
+    if self.dim() < 2 or source.dim() < 2 or mask.dim() != self.dim():
+        return f"rank: self={self.dim()} mask={mask.dim()} source={source.dim()}"
+    # One mask entry per row: every dim but the last must match self exactly, so
+    # mask[..., 0] has exactly `rows` elements. (The last dim may differ: it is
+    # either a literal 1 or a broadcast of cols -- checked below.)
+    if tuple(mask.shape[:-1]) != tuple(self.shape[:-1]):
+        return (
+            f"mask leading dims {tuple(mask.shape[:-1])} != self "
+            f"{tuple(self.shape[:-1])}"
+        )
+    cols = self.shape[-1]
+    # cols <= 1 is a degenerate row that offers no block-per-row equivalence.
+    if cols <= 1:
+        return f"degenerate last dim: cols={cols}"
+    if source.shape[-1] != cols:
+        return f"source last dim {source.shape[-1]} != self last dim {cols}"
+    # Per-row means the mask is constant across the last dim. Accept a literal
+    # size-1 last dim (un-expanded) or a broadcast last dim (stride 0); reject a
+    # genuinely per-element mask (last dim cols with a non-zero stride).
+    if mask.shape[-1] != 1 and mask.stride(-1) != 0:
+        return (
+            f"mask is not per-row in its last dim (shape {tuple(mask.shape)}, "
+            f"stride {tuple(mask.stride())})"
+        )
+    return None
+
+
+@register_spyre_decompositions([torch.ops.aten.masked_scatter.default])
+def spyre_masked_scatter(
+    self: torch.Tensor,
+    mask: torch.Tensor,
+    source: torch.Tensor,
+) -> torch.Tensor:
+    """`masked_scatter` for a mask that is broadcast along the last dim.
+
+    Such a mask (`stride(-1) == 0` -- e.g. an attention mask `[B, S]`
+    expanded to `[B, S, C]`) selects *whole rows*: row `i`, if selected,
+    consumes exactly one contiguous `C`-element block of `source`, i.e. one
+    whole row of `source.reshape(-1, C)`. The gather is then
+    `source_2d[row_idx]` -- a 1D index into the row dim of a 2D source, which
+    is a plain stick gather.
+
+    Any other mask makes this an element-level op, which Spyre cannot express:
+    the index would have to address an element inside a *packed* 1D source, and
+    a lane within a stick is not addressable. Exploding the source to one
+    element per stick does not help -- that splits every stick 64 ways, an
+    element scatter the backend cannot lower. So the generic form is rejected
+    here rather than emitting a gather that fails deeper in layout propagation.
+    """
+    reason = _masked_scatter_reject_reason(self, mask, source)
+    if reason is not None:
+        raise Unsupported(
+            f"masked_scatter needs a mask broadcast along the last dim so it "
+            f"selects whole rows ({reason}). An element-level masked_scatter "
+            f"would gather individual elements from a packed 1D source, and a "
+            f"lane within a stick is not addressable on Spyre."
+        )
+
+    cols = self.shape[-1]
+    rows = self.numel() // cols
+    # Collapse the broadcast dim: one bool per row.
+    mask_row = mask[..., 0].reshape(rows)
+    source_2d = source.reshape(-1, cols)
+    # masked_scatter requires source.numel() >= mask.sum(). For a whole-row
+    # mask, source_2d needs at least as many rows as there are selected rows.
+    torch._assert_async(
+        mask_row.sum() <= source_2d.shape[0],
+        "masked_scatter: source is too short -- it has fewer rows than the "
+        "number of selected (True) mask rows.",
+    )
+    # Row i reads source row (prefix-count of selected rows - 1). Unselected
+    # rows would get -1, so multiply by the mask to send them to row 0 instead
+    # (in bounds, and discarded by the where). Done in fp32: Spyre has no usable
+    # int `clip`, int32 sub/mul are unsupported, and fp16 loses large indices.
+    pos = mask_row.cumsum(0).to(torch.float32) - 1.0
+    row_idx = (pos * mask_row.to(torch.float32)).to(torch.int64)
+    # The gather stays 2D (its args are indirect, so the pointwise dim_order
+    # projection skips them), but the `where` must stay at `self`'s rank:
+    # that projection computes `rank_diff = len(output) - len(arg)` and only
+    # handles inputs of *lower* rank. A lower-rank output against the full-rank
+    # ND mask gives rank_diff < 0, which shifts dims the wrong way and builds a
+    # layout whose dim_order rank no longer matches host_size ("Incompatible
+    # host_size and dim_order"). Reshaping back to ND keeps every `where`
+    # input rank-aligned with the output.
+    gathered = source_2d[row_idx].reshape(self.shape)
+    return torch.where(mask, gathered, self)
