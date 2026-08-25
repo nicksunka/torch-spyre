@@ -21,7 +21,7 @@ test_suite_config:
             - TestMemoryProfilerTimeline::test_memory_timeline_no_id_cpu
           mode: mandatory_success
         - names:
-            - test_find_kernel_overlaps
-            - test_find_kernel_overlaps_invalid_events
+            - test_find_device_overlaps
+            - test_find_device_overlaps_invalid_events
             - test_kernel_time_overlap
           mode: mandatory_success
