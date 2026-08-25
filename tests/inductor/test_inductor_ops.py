@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import math
+import sys
 import pytest
 import unittest
 import torch
@@ -31,7 +33,9 @@ from utils_inductor import (
     compare_with_pytorch,
 )
 import utils_inductor
-from torch._inductor.utils import run_and_get_code
+from unittest import mock
+from torch_spyre._inductor import config as inductor_config
+from torch._inductor.utils import fresh_inductor_cache, run_and_get_code
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import IDENTITY_OP
 
@@ -351,6 +355,31 @@ def _dtype_name(dt):
     return str(dt).split(".")[-1]
 
 
+@functools.lru_cache(maxsize=None)
+def _cached_randint(shape, dtype):
+    gen = utils_inductor._make_generator(shape, dtype)
+    return torch.randint(0, 512, shape, dtype=dtype, generator=gen)
+
+
+@functools.lru_cache(maxsize=None)
+def _cached_fp32_for_int32_cast(shape):
+    """Generate fp32 tensor from truncated int32 values for testing fp32->int32.
+
+    Avoids pathological cases where random fp32 all truncate to 0. Instead,
+    we generate int32 values (0-512), cast to fp32, ensuring the truncation
+    test covers meaningful value ranges.
+    """
+    gen = utils_inductor._make_generator(shape, torch.int32)
+    src_int = torch.randint(0, 512, shape, dtype=torch.int32, generator=gen)
+    return src_int.to(torch.float32)
+
+
+def _cached_to_dtype_input(shape, src):
+    if src.is_floating_point:
+        return cached_randn(shape, dtype=src)
+    return _cached_randint(shape, src)
+
+
 TO_DTYPE_OP_MAP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}": (src, dst)
     for src, dst in ALL_DTYPE_PAIRS
@@ -358,7 +387,9 @@ TO_DTYPE_OP_MAP_PARAMS_SETS = {
 
 TO_DTYPE_OP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
-        cached_randn(shape, dtype=src),
+        _cached_fp32_for_int32_cast(shape)
+        if (src, dst) == (torch.float32, torch.int32)
+        else _cached_to_dtype_input(shape, src),
         dst,
     )
     for src, dst in DtypeOpTable.get_dtype_pairs()
@@ -375,8 +406,18 @@ TO_DTYPE_OP_EXPECT_FAIL = [
     for shape in TO_DTYPE_OP_SHAPES
     if (
         shape in _DTYPE_OP_ALL_OPS_FAIL_SHAPES
-        or DtypeOpTable.get_operator(src, dst) != IDENTITY_OP
-        or (src == torch.float32 and shape[-1] < 32)
+        or (
+            DtypeOpTable.get_operator(src, dst) != IDENTITY_OP
+            and (src, dst)
+            not in [(torch.float32, torch.int32), (torch.int32, torch.float32)]
+        )
+        # Sub-stick guard doesn't apply to fp32<->int32 — both are 32-bit,
+        # so there's no width change to trip the fp16-stick boundary.
+        or (
+            src == torch.float32
+            and shape[-1] < 32
+            and (src, dst) != (torch.float32, torch.int32)
+        )
     )
 ]
 
@@ -1178,14 +1219,88 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_topk", "test_topk_cpu"): {
             "param_sets": {
+                "2d_k1_dim0": (unique_randn_along_dim((64, 256), dim=0), 1, 0),
                 "2d_k4_dim0": (unique_randn_along_dim((64, 256), dim=0), 4, 0),
                 "2d_k4_dim_minusone": (
                     unique_randn_along_dim((64, 256), dim=-1),
                     4,
                     -1,
                 ),
-                # "2d_k4_dim0_lessthanstick": (unique_randn_along_dim((8, 32), dim=0), 4, 0),
-                # "2d_k4_dim_minusone_lessthanstick": (unique_randn_along_dim((1, 32), dim=-1), 4, -1),
+                "3d_k2_dim1": (
+                    unique_randn_along_dim((64, 71, 256), dim=1),
+                    2,
+                    1,
+                ),
+                "3d_k3_dim1": (
+                    unique_randn_along_dim((67, 71, 256), dim=1),
+                    3,
+                    1,
+                ),
+                "3d_k4_dim0": (
+                    unique_randn_along_dim((67, 71, 256), dim=0),
+                    4,
+                    0,
+                ),
+                "4d_k2_dim1": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=1),
+                    2,
+                    1,
+                ),
+                "4d_k3_dim2": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=2),
+                    3,
+                    2,
+                ),
+                "4d_k4_dim0": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=0),
+                    4,
+                    0,
+                ),
+                "2d_k8_dim0": (
+                    unique_randn_along_dim((256, 256), dim=0),
+                    8,
+                    0,
+                ),
+                "2d_k32_dim0": (
+                    unique_randn_along_dim((256, 32), dim=0, dtype=torch.float32),
+                    32,
+                    0,
+                ),
+                "3d_k12_dim1": (
+                    unique_randn_along_dim((2, 64, 32), dim=1, dtype=torch.float32),
+                    12,
+                    1,
+                ),
+                "3d_k20_dim1": (
+                    unique_randn_along_dim((6, 256, 32), dim=1, dtype=torch.float32),
+                    20,
+                    1,
+                ),
+                "4d_k32_dim2": (
+                    unique_randn_along_dim((2, 8, 128, 32), dim=2, dtype=torch.float32),
+                    32,
+                    2,
+                ),
+                "2d_k8_dim_0_fp16": (
+                    unique_randn_along_dim((32, 192), dim=0),
+                    8,
+                    0,
+                ),
+                "3d_k16_dim_1_fp16": (
+                    unique_randn_along_dim((4, 64, 192), dim=1),
+                    16,
+                    1,
+                ),
+                "4d_k10_dim2_fp16": (
+                    unique_randn_along_dim((2, 4, 64, 64), dim=2),
+                    10,
+                    2,
+                ),
+                "2d_k128_dim_0": (
+                    unique_randn_along_dim((256, 64), dim=0),
+                    128,
+                    0,
+                ),
             },
         },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {
@@ -4885,6 +5000,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_conv2d", "test_conv2d_cpu"): {
             "param_sets": {
+                # Patch-embed conv with bias: stride-16 kernel gives a sub-stick
+                # spatial output (W_out == 8 < 64) whose flat H_out*W_out == 64 is
+                # stick-aligned. Regression for the bias broadcast layout bug --
+                # every other case below uses bias=None.
+                "1x6x128_patch16_bias": (
+                    cached_randn((1, 6, 128, 128)),
+                    cached_randn((64, 6, 16, 16)),
+                    cached_randn((64,)),
+                    (0, 0),
+                    (16, 16),
+                    1,
+                ),
                 "1x3x32_ksize3_no_pad": (
                     cached_randn((1, 3, 32, 32)),
                     cached_randn((16, 3, 3, 3)),
@@ -4960,7 +5087,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # Caveat, measured: xfail asserts only *that* the case fails, not
             # that padding is the reason.  Removing just the lowering guard does
             # not make it XPASS -- the compile then reaches the backend and
-            # dxp_standalone aborts (SIGABRT), which is the runtime support the
+            # aborts (SIGABRT), which is the runtime support the
             # guard's own message refers to.  So this entry tracks "depthwise +
             # padding does not work end to end"; a message-asserting negative
             # test would additionally pin *where* it is rejected.
@@ -5089,6 +5216,120 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     [[128, 128, 1, 1, 64], [5, 5, 1, 1, 64]],
                     [[1, 128, -1, 49152, 16384], [1, 5, -1, 25, 25]],
                 ),
+            },
+        },
+        # conv2d exercising the native conv2d SDSC path (lower_convolution) with
+        # the direct-lowering flag on (config.conv2d_direct_lowering). Only a
+        # true 1x1 kernel falls back: it has size-1 window taps on *both* axes,
+        # so the SDSC carries no window dim and the backend rejects it. A
+        # 1xN / Nx1 kernel keeps one window dim and direct-lowers (see the k1x3
+        # / k3x1 cases below) -- 1x1 is covered by the ("test_conv2d", ...) case
+        # "2x3x32_ksize1" above (with NCHW input), so it is intentionally not
+        # duplicated here (this test feeds channel-last input, which suits direct
+        # lowering but not the decomposition's reshape path). Supported direct
+        # cases: fp16, groups==1, non-transposed, zero padding, dilation==1.
+        # Params are standard NCHW (x, weight[C_out,C_in,kH,kW], bias, stride);
+        # the test builds the channel-last device tensors and toggles the flag.
+        ("test_conv2d_direct", "test_conv2d_direct_base"): {
+            "param_sets": {
+                # 2x2 kernel, zero padding -- smallest direct-lowered window.
+                "1x64x8x8_k2": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((64, 64, 2, 2)),
+                    None,
+                    (1, 1),
+                ),
+                # 3x3 kernel, zero padding -- the reference "working conv with
+                # zero padding" shape.
+                "1x64x8x8_k3": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((64, 64, 3, 3)),
+                    None,
+                    (1, 1),
+                ),
+                # Batch N>1 with a 3x3 kernel.
+                "2x64x8x8_k3": (
+                    cached_randn((2, 64, 8, 8)),
+                    cached_randn((64, 64, 3, 3)),
+                    None,
+                    (1, 1),
+                ),
+                # Bias present: lowered as a separate channel-wise pointwise add.
+                "1x64x8x8_k3_bias": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((64, 64, 3, 3)),
+                    cached_randn((64,)),
+                    (1, 1),
+                ),
+                # C_out != C_in (32 output channels), 3x3 kernel.
+                "1x64x8x8_k3_cout32": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((32, 64, 3, 3)),
+                    None,
+                    (1, 1),
+                ),
+                # 1xN kernel (kH==1, kW==3): a 1-D conv along width. The kH tap
+                # is size-1 and squeezed out, so the SDSC carries only the kW
+                # window dim -- the backend accepts a single window dim, so
+                # this direct-lowers (a 1-D conv) rather than falling back.
+                "1x64x8x8_k1x3": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((64, 64, 1, 3)),
+                    None,
+                    (1, 1),
+                ),
+                # Nx1 kernel (kH==3, kW==1): a 1-D conv along height. Mirror of
+                # the 1xN case on the other spatial axis.
+                "1x64x8x8_k3x1": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((64, 64, 3, 1)),
+                    None,
+                    (1, 1),
+                ),
+                # --- Strided convolutions (stride 2). Correctness needs two
+                # things: (1) the output spatial dims i/j must not be split
+                # across cores, or the per-core input span shuffles -- so
+                # disable_conv2d_spatial_split clamps i/j splits to 1 (see
+                # superdsc parse_op_spec is_conv); and (2) the input WIDTH must
+                # be evenly tiled by the strided windows. The fp16 conv opfunc
+                # tiles the output width (Tj=4) but processes height row-by-row
+                # (Ti=1), so when (W_in - kW) % sW != 0 the dangling partial
+                # column is mis-accumulated. Clean-width cases direct-lower;
+                # ragged-width cases fall back to im2col+matmul (declined in
+                # _is_direct_conv_supported). Verified on Spyre HW.
+                #
+                # Clean width ((W_in-kW) % sW == 0) -> direct lowering. 13x13
+                # (->6x6, not tile-aligned) and 17x17 (->8x8, tile-aligned)
+                # cover both output alignments.
+                "1x64x13x13_k3_s2": (
+                    cached_randn((1, 64, 13, 13)),
+                    cached_randn((64, 64, 3, 3)),
+                    None,
+                    (2, 2),
+                ),
+                "1x64x17x17_k3_s2": (
+                    cached_randn((1, 64, 17, 17)),
+                    cached_randn((64, 64, 3, 3)),
+                    None,
+                    (2, 2),
+                ),
+                # Ragged HEIGHT, clean width (H:(8-3)%2=1, W:(9-3)%2=0). Height
+                # is untiled, so a ragged height is harmless -- this still
+                # direct-lowers and matches CPU (proves the width-tiling
+                # constraint is on width only, not either spatial dim).
+                "1x64x8x9_k3_s2": (
+                    cached_randn((1, 64, 8, 9)),
+                    cached_randn((64, 64, 3, 3)),
+                    None,
+                    (2, 2),
+                ),
+                # The declined corners -- ragged input width ((W_in-kW)%sW != 0)
+                # and kernel > 3 -- are covered by the pure-Python predicate test
+                # (test_conv2d_direct_support_predicate), not end-to-end here:
+                # once declined they route to the im2col+matmul decomposition,
+                # whose custom-op reshape does not handle this test's
+                # channel-last weight layout (a separate, pre-existing issue
+                # unrelated to direct lowering).
             },
         },
         ("test_avg_pool2d", "test_avg_pool2d_base"): {
@@ -5844,6 +6085,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(
             lambda x: torch.topk(x, k, dim=dim)[0], x, run_eager=False
         )
+
+    def test_topk_largest_false_rejected(self):
+        # largest=False cannot be served by the topkvalue/topkindex reduction
+        # (it always returns the largest elements), so compile must raise.
+        x = unique_randn_along_dim((64, 256), dim=0)
+        with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(
+                lambda x: torch.topk(x, 4, dim=0, largest=False)[0],
+                [x],
+                "spyre",
+            )
+
+    def test_topk_unsplittable_k_rejected(self):
+        # k=35's divisors are 1, 5, 7, 35: none give k // d <= 4 with
+        # d <= SENCORES (32), so no valid multi-core split exists.
+        x = unique_randn_along_dim((64, 35), dim=-1)
+        with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(
+                lambda x: torch.topk(x, 35, dim=-1)[0],
+                [x],
+                "spyre",
+            )
 
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
@@ -6808,6 +7071,155 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(fn, q, k, v, attn_mask, is_causal, enable_gqa)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_sdpa_bf16_gqa_noncontiguous_query_pool_planning(self):
+        """Regression test for issue #3775: a bf16 GQA SDPA result with a
+        non-contiguous query (the `view(...).transpose(1, 2)` layout normal
+        transformer attention blocks produce) and an in-bundle consumer (the
+        trailing `+ 0`) previously returned finite but catastrophically wrong
+        values under HBM pool planning, because the SDPA output buffer's
+        cross-bundle allocation-dict aliasing was not detected as pool-
+        ineligible. Adapted from the standalone reproducer posted on PR #3707
+        by arielge, which traced this to 0/5 matching generation tokens on
+        Qwen2.5-1.5B in bf16."""
+        generator = torch.Generator().manual_seed(1337)
+        q_source = (
+            torch.randn((1, 64, 1536), dtype=torch.bfloat16, generator=generator) * 0.1
+        )
+        k_source = (
+            torch.randn((1, 64, 256), dtype=torch.bfloat16, generator=generator) * 0.1
+        )
+        v_source = (
+            torch.randn((1, 64, 256), dtype=torch.bfloat16, generator=generator) * 0.1
+        )
+        q = q_source.view(1, 64, 12, 128).transpose(1, 2)
+        k = k_source.view(1, 64, 2, 128).transpose(1, 2).contiguous()
+        v = v_source.view(1, 64, 2, 128).transpose(1, 2).contiguous()
+        mask = torch.zeros((1, 1, 64, 64), dtype=torch.bfloat16)
+        upper = torch.triu(torch.ones(64, 64, dtype=torch.bool), 1)
+        mask[:, :, upper] = torch.finfo(torch.bfloat16).min
+
+        def fn(q, k, v, mask):
+            attention = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=1 / 128**0.5,
+                enable_gqa=True,
+            )
+            return attention + 0
+
+        expected = fn(q, k, v, mask)
+        actual = torch.compile(fn, dynamic=False)(
+            q.to("spyre"), k.to("spyre"), v.to("spyre"), mask.to("spyre")
+        ).cpu()
+
+        expected = expected.float().flatten()
+        actual = actual.float().flatten()
+        cosine = F.cosine_similarity(actual, expected, dim=0).item()
+        assert torch.isfinite(actual).all() and cosine >= 0.99, (
+            f"cosine={cosine:.8f} max_abs={(actual - expected).abs().max().item():.8f}"
+        )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_sdpa_bf16_gqa_decode_query_is_canonicalized(self):
+        """Decode SDPA must canonicalize a physically heads-inner query."""
+        num_heads, num_kv_heads, head_dim = 16, 1, 512
+        generator = torch.Generator().manual_seed(1337)
+        query = (
+            torch.randn(
+                (1, num_heads, 1, head_dim),
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.1
+        )
+        key = (
+            torch.randn(
+                (1, num_kv_heads, 64, head_dim),
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.1
+        )
+        value = (
+            torch.randn(
+                (1, num_kv_heads, 64, head_dim),
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            * 0.1
+        )
+        mask = torch.zeros((1, 1, 1, 64), dtype=torch.bfloat16)
+
+        def fn(query, key, value, mask):
+            return F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=1 / head_dim**0.5,
+                enable_gqa=True,
+            )
+
+        # This is the exact device tiling emitted for Gemma's in-graph RoPE
+        # query at decode: logical [B, H, 1, D], but heads nested after the
+        # stick axis.  Construct it explicitly so the regression does not
+        # depend on hash-sensitive LX allocation decisions.
+        layout_type = sys.modules["torch_spyre._C"].SpyreTensorLayout
+        heads_inner = layout_type(
+            list(query.size()),
+            list(query.stride()),
+            query.dtype,
+            [1, 0, 2, 3],
+        )
+        assert list(heads_inner.device_size) == [1, 1, 8, num_heads, 64]
+        query_spyre = query.to("spyre", device_layout=heads_inner)
+
+        bmm_x_sizes = []
+        spyre_kernel = sys.modules["torch_spyre._inductor.spyre_kernel"]
+        original_create_op_spec = spyre_kernel.SpyreKernel.create_op_spec
+
+        def capture_bmm_x(self, op, is_reduction, args, op_info, *a, **kw):
+            if op == "batchmatmul" and args:
+                bmm_x_sizes.append(list(args[0].device_size))
+            return original_create_op_spec(
+                self, op, is_reduction, args, op_info, *a, **kw
+            )
+
+        # OpSpec construction is skipped on a generated-code cache hit, so a
+        # fresh cache is part of the test fixture rather than relying on the
+        # state left by earlier tests in the same worker.
+        with (
+            fresh_inductor_cache(),
+            mock.patch.object(
+                spyre_kernel.SpyreKernel, "create_op_spec", capture_bmm_x
+            ),
+        ):
+            actual = torch.compile(fn, dynamic=False)(
+                query_spyre,
+                key.to("spyre"),
+                value.to("spyre"),
+                mask.to("spyre"),
+            ).cpu()
+
+        expected = fn(query, key, value, mask)
+        cosine = F.cosine_similarity(
+            actual.float().flatten(), expected.float().flatten(), dim=0
+        ).item()
+        assert torch.isfinite(actual).all() and cosine >= 0.99, (
+            f"cosine={cosine:.8f} "
+            f"max_abs={(actual.float() - expected.float()).abs().max().item():.8f}"
+        )
+
+        query_elems = num_heads * head_dim
+        query_sizes = [ds for ds in bmm_x_sizes if math.prod(ds) == query_elems]
+        assert query_sizes, f"no score-matmul query found in {bmm_x_sizes}"
+        assert all(ds[0] == num_heads for ds in query_sizes), query_sizes
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_implicit_loading(self):
         def test(end, device=None):
             return torch.arange(end, device=device, dtype=torch.float16)
@@ -6896,11 +7308,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         """Test that offset-stick slice mutation raises Unsupported when no alt dim is divisible by stick_size."""
 
         def fn(x, y):
-            x[:, 32:96].copy_(y)
+            x[32:96].copy_(y)
             return x.clone()
 
-        x = torch.randn(63, 128, dtype=torch.float16, device="spyre")
-        y = torch.randn(63, 64, dtype=torch.float16, device="spyre")
+        x = torch.randn(128, dtype=torch.float16, device="spyre")
+        y = torch.randn(64, dtype=torch.float16, device="spyre")
 
         compiled = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=False)
         with pytest.raises(Exception) as exc_info:
@@ -7283,6 +7695,92 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             groups,
             atol=0.5,
             rtol=0.1,
+        )
+
+    def test_conv2d_direct_base(self, x, weight, bias, stride):
+        # Exercises the native conv2d SDSC (lower_convolution), not the
+        # im2col+matmul decomposition. Enabled via config.conv2d_direct_lowering
+        # so aten.convolution survives decomposition and reaches the lowering.
+        #
+        # Spyre stores C as the stick (innermost) dim, so the activation must be
+        # physically channel-last (NHWC) and the weight must stick on C_out.  We
+        # hand the harness channel-last-contiguous tensors (their layout is
+        # preserved by .to("spyre")) and permute back to the logical NCHW /
+        # [C_out,C_in,kH,kW] layouts inside fn, so the standard compare_with_cpu
+        # harness holds (cpu fn(x_nhwc, w_dev, b) == spyre fn(...)).
+        #
+        # run_eager=False: Spyre has no eager conv2d kernel; only the compiled
+        # (direct-lowering) path is valid here.
+        x_nhwc = x.permute(0, 2, 3, 1).contiguous()  # [N, H, W, C_in]
+        w_dev = weight.permute(1, 2, 3, 0).contiguous()  # [C_in, kH, kW, C_out]
+
+        def fn(xc, wc, b):
+            xn = xc.permute(0, 3, 1, 2)  # NHWC -> NCHW
+            wn = wc.permute(3, 0, 1, 2)  # [C_in,kH,kW,C_out] -> [C_out,C_in,kH,kW]
+            out = torch.conv2d(xn, wn, b, stride=stride, padding=0, groups=1)
+            return out.permute(0, 2, 3, 1)  # NCHW -> NHWC
+
+        with mock.patch.object(inductor_config, "conv2d_direct_lowering", True):
+            self.compare_with_cpu(
+                fn,
+                x_nhwc,
+                w_dev,
+                bias,
+                atol=0.5,
+                rtol=0.1,
+                run_eager=False,
+            )
+
+    def test_conv2d_direct_support_predicate(self):
+        # Pure-Python guard check (no compile/hardware): the direct-lowering
+        # support predicate must decline the corners the Spyre conv SDSC / fp16
+        # opfunc cannot handle, so those convs stay on the im2col+matmul
+        # decomposition. Covered here:
+        #  - C_in not a multiple of the fp16 stick width (the direct SDSC
+        #    contracts over C_in with no partial-stick handling);
+        #  - kernel tap > 3 (the dense C_in*kH*kW contraction overflows the
+        #    LX scratchpad budget);
+        #  - ragged input width under stride, (W_in - kW) % sW != 0 (the fp16
+        #    opfunc tiles the output width and mis-accumulates the dangling
+        #    column; a ragged height is untiled and harmless).
+        from torch_spyre._inductor.decompositions import _is_direct_conv_supported
+        from torch_spyre._C import get_elem_in_stick
+
+        eps = get_elem_in_stick(torch.float16)  # 64 at fp16
+        common = dict(
+            stride=[1, 1],
+            transposed=False,
+            output_padding=[0, 0],
+            padding=[0, 0],
+            dilation=[1, 1],
+            groups=1,
+        )
+
+        def _supported(c_in, k=3, hw=8, **overrides):
+            x = torch.zeros(1, c_in, hw, hw, dtype=torch.float16)
+            w = torch.zeros(eps, c_in, k, k, dtype=torch.float16)
+            return _is_direct_conv_supported(x, w, **{**common, **overrides})
+
+        # C_in stick alignment.
+        self.assertTrue(_supported(eps), f"C_in={eps} should direct-lower")
+        self.assertTrue(_supported(2 * eps), f"C_in={2 * eps} should direct-lower")
+        self.assertFalse(
+            _supported(eps // 2), f"C_in={eps // 2} must fall back (not stick-aligned)"
+        )
+        self.assertFalse(_supported(3), "C_in=3 must fall back (not stick-aligned)")
+
+        # Kernel > 3 (dense contraction overflows LX).
+        self.assertTrue(_supported(eps, k=3), "k=3 should direct-lower")
+        self.assertFalse(_supported(eps, k=5), "k=5 must fall back (LX overflow)")
+
+        # Ragged input width under stride: (W_in - kW) % sW != 0.
+        self.assertTrue(
+            _supported(eps, k=3, hw=9, stride=[2, 2]),  # (9-3)%2==0, clean
+            "clean strided width should direct-lower",
+        )
+        self.assertFalse(
+            _supported(eps, k=3, hw=8, stride=[2, 2]),  # (8-3)%2==1, ragged
+            "ragged strided width must fall back",
         )
 
     def test_dwise_conv2d_cpu(

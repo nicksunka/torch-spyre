@@ -14,6 +14,7 @@
 
 import torch
 from torch_spyre._C import (
+    SymbolicArg,
     launch_jobplan,
     prepare_kernel,
     register_kernel_provenance,
@@ -71,13 +72,17 @@ class SpyreSDSCKernelRunner:
                 self.profiler_event_name,
                 list(kernel_provenance.debug_handle_ids),
             )
-            self.jobplan = prepare_kernel(
-                spyrecode_dir,
-                profiler_name=self.profiler_event_name,
-            )
+            with torch.profiler.record_function(f"prepare_kernel:{self.kernel_name}"):
+                self.jobplan = prepare_kernel(
+                    spyrecode_dir,
+                    profiler_name=self.profiler_event_name,
+                )
 
     @with_ffdc(CATEGORY_RUNTIME_LAUNCH, logger)
-    def run(self, *args, **kw_args):
+    def run(self, *args, symbolic_args: list[SymbolicArg] | None = None, **kw_args):
         logger.info("RUN: %s %s", self.kernel_name, self.code_dir)
         with torch.profiler.record_function(f"launch_jobplan:{self.kernel_name}"):
-            launch_jobplan(self.jobplan, args)
+            if symbolic_args:
+                launch_jobplan(self.jobplan, args, symbolic_args)
+            else:
+                launch_jobplan(self.jobplan, args)

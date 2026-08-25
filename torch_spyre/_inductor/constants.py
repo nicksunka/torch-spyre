@@ -31,6 +31,8 @@ REDUCTIONS_NON_STICK_DIM_ONLY = {"prod"}
 DL16TOFP32_OP = "dl16tofp32"
 FP32TODL16_OP = "fp32todl16"
 FP8TODL16_OP = "fp8todl16"
+FP32TOINT32_OP = "fp32toint32"
+INT32TOFP32_OP = "int32tofp32"
 
 DEVICE_NAME = "spyre"
 
@@ -130,6 +132,12 @@ SEGMENT_OFFSETS = [
 INTERMEDIATES_SEGMENT = 0x0
 SEGMENT_SIZE = 0x400000000
 
+# The intermediates pool must leave headroom below the full segment size --
+# 2 GiB is reserved for other segment-7 consumers (e.g. kernel-address/dim
+# symbol bookkeeping), so the pool itself may never grow to claim the whole
+# segment.
+MAX_POOL_SIZE_BYTES = SEGMENT_SIZE - 2 * 1024**3
+
 SPYRE_FP32_OPS = [
     "add",
     "sub",
@@ -191,6 +199,37 @@ AVGPOOL2D_OP = "avgpoolfwd"
 # _is_pool stays a single membership test rather than a growing chain of ==.
 POOL_OPS = {AVGPOOL2D_OP}
 
+# Conv opfunc names. conv2d is a two-input reduction (activation + weight) with
+# windowed spatial dims -- a hybrid of the matmul and pool patterns. Kept as a
+# set so _is_conv is a single membership test as fp8/int8/int4 variants land.
+CONV2D_FWD_OP = "conv2d"
+# Both the forward conv2d (aten.convolution direct lowering, PR #3284) and the
+# depthwise conv2d (spyre.conv2d, PR #3510) op strings are convolutions for the
+# purposes of codegen dispatch (_is_conv). DEPTHWISE_CONV2D_OP is defined above.
+CONV_OPS = {CONV2D_FWD_OP, DEPTHWISE_CONV2D_OP}
+
+# Two-input reductions dispatched together in spyre_kernel.store_reduction:
+# matmul (activation @ weight) and conv2d (activation * weight, reduced over
+# in/ki/kj) both build [input, weight, output] tensor args.
+TWO_INPUT_REDUCTION_OPS = frozenset(
+    {BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP, CONV2D_FWD_OP}
+)
+
+# Depthwise conv is a two-input reduction like TWO_INPUT_REDUCTION_OPS but is
+# dispatched in its own branch in spyre_kernel.store_reduction because it
+# builds its tensor args differently (one filter per input channel).
+DEPTHWISE_CONV_REDUCTION_OPS = frozenset({DEPTHWISE_CONV2D_OP})
+
+# Single-input reductions: everything store_reduction dispatches to its
+# fallback branch (exactly one input TensorArg). These are PyTorch/Inductor
+# reduction_type strings (sum/mean/max/min/prod) plus Spyre-specific reduction
+# ops (exx2, topkvalue/topkindex, avgpoolfwd) -- there is no upstream registry
+# of supported reduction_type strings to derive this from, so it is written
+# down here explicitly.
+SINGLE_INPUT_REDUCTION_OPS = frozenset(
+    {"sum", "mean", "max", "min", "prod", "exx2", *TOPK_OPS, AVGPOOL2D_OP}
+)
+
 # Populate more valid labels from deeptools here if needed
 INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j", "ki", "kj"]
 OUTPUT_DIM_LABELS = ["out"]
@@ -202,3 +241,14 @@ CONV2D_DIM_LABELS = ["mb", "out", "i", "j", "ki", "kj"]
 # (OpSpec.node_output_ranges), never from these strings, so SDSC naming does not
 # leak above codegen.
 POOL_DIM_LABELS = ["mb", "i", "j", "out", "ki", "kj"]
+# Canonical conv2d iteration-space order, mirroring POOL_DIM_LABELS: batch,
+# out-H, out-W, out-channel, in-channel (the contraction dim), kernel-H,
+# kernel-W. Like the pool labels, these SDSC strings are owned by the codegen
+# layer. Codegen maps each iteration symbol to a role structurally, from the
+# args' access expressions (set membership and co-occurrence in
+# device_coordinates), never from sizes or positions -- see
+# _match_labels_by_structure and _CONV_ROLE_LABELS in codegen/superdsc.py.
+# Squeezed size-1 roles (e.g. batch N==1) never appear as symbols and drop out
+# for free, so the mapping stays aligned with the surviving iteration-space
+# dims.
+CONV_DIM_LABELS = ["mb", "i", "j", "out", "in", "ki", "kj"]
