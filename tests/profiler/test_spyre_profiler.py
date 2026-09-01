@@ -195,6 +195,7 @@ def test_chrome_trace_is_valid_json(tmp_path):
 
 def _run_trace_analyzer_overlap_verification(trace_data):
     """Run Trace Analyzer overlap verification and return its result and report."""
+    pytest.importorskip("aiu_trace_analyzer", minversion="1.3.0")
     from aiu_trace_analyzer.core.acelyzer import Acelyzer
 
     analyzer = Acelyzer(
@@ -460,6 +461,15 @@ def test_trace_analyzer_device_overlap(tmp_path):
     assert trace_file.exists(), "Chrome trace file was not created"
 
     trace_data = trace_file.read_bytes()
+
+    trace_json = json.loads(trace_data)
+    trace_events = trace_json.get("traceEvents", [])
+    device_events, _ = _find_device_overlaps(trace_events)
+
+    assert len(device_events) >= 2, (
+        "Expected at least two Spyre device events for Trace Analyzer overlap validation"
+    )
+
     overlap_result, report = _run_trace_analyzer_overlap_verification(trace_data)
 
     if overlap_result.get("result") != "pass":
