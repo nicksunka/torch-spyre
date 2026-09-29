@@ -29,6 +29,16 @@ from .scratchpad.lx_context_switching import mark_lx_safe
 aten = torch.ops.aten
 
 
+@torch.library.custom_op("spyre::tile_dim_marker", mutates_args=())
+def tile_dim_marker(x: torch.Tensor, dim: int) -> torch.Tensor:
+    return x.clone()
+
+
+@tile_dim_marker.register_fake
+def _(x: torch.Tensor, dim: int) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
 @torch.library.custom_op("spyre::softplus", mutates_args=(), device_types="spyre")
 def softplus(
     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
@@ -833,6 +843,20 @@ def _(input: torch.Tensor) -> torch.Tensor:
     return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
 
 
+# Both quantize_fp8_with_scale and quantize_weight_fp8_with_scale share the same
+# four-step pipeline; the only difference is the final format-conversion kernel:
+#   1. Compute inverse scale: inv_scale = 1 / scale  (reciprocal, hardware sfp unit)
+#   2. Scale the input:       x_scaled = x * inv_scale  (POINTWISE)
+#   3. Clamp to FP8 E4M3:    x_clamped = clamp(x_scaled, -448, 448)  (POINTWISE)
+#   4. Format conversion:     qfp8ch (activation) or qfp8wt (weight)  (POINTWISE)
+#
+# The reciprocal in step 1 is emitted as a separate hardware op. For scalar or
+# broadcast scales the compiler does not currently fuse it into a single multiply,
+# so there is one sfp-unit op for 1/scale and one for x * inv_scale.  Callers with
+# a hot-path constraint can pre-compute inv_scale and pass it directly to the
+# underlying spyre.qfp8ch / spyre.qfp8wt decomposition ops instead.
+
+
 @torch.library.custom_op(
     "spyre::quantscalepertokenfp8", mutates_args=(), device_types="spyre"
 )
@@ -893,31 +917,26 @@ def _(input: torch.Tensor, scale_ub: float = FP8_E4M3FN_MAX) -> torch.Tensor:
 @torch.library.custom_op(
     "spyre::quantize_fp8_with_scale", mutates_args=(), device_types="spyre"
 )
-def quantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """
-    Quantize FP16 tensor to FP8 using pre-computed scale.
+@compile_once("spyre.quantize_fp8_with_scale")
+def quantize_fp8_with_scale(
+    input: torch.Tensor, scale: torch.Tensor, compiled
+) -> torch.Tensor:
+    """Quantize FP16 activation tensor to FP8 using a pre-computed scale.
 
-    Performs four steps:
-    1. Compute inverse scale: inv_scale = 1 / scale (reciprocal, POINTWISE on sfp unit)
-    2. Scale the input: x_scaled = x * inv_scale (POINTWISE)
-    3. Clamp to FP8 E4M3 range: x_clamped = clamp(x_scaled, -448, 448) (POINTWISE)
-    4. Convert to FP8 format: x_fp8 = qfp8ch(x_clamped) (POINTWISE format conversion)
+    Implements the four-step pipeline described above using qfp8ch for the
+    final format conversion (activation / channel layout).
 
     Args:
-        input: Input tensor (FP16) to quantize, shape [batch, seq, hidden]
+        input: FP16 activation tensor to quantize, shape [batch, seq, hidden]
         scale: Quantization scale (FP16), shape [batch, seq, 1]
 
     Returns:
-        FP8 E4M3 tensor (same shape as input)
-
-    Example:
-        >>> x = torch.randn(2, 4, 8, dtype=torch.float16, device='spyre')
-        >>> x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+        FP8 E4M3 tensor with the same shape as input.
 
     Note:
-        - Uses reciprocal operation (hardware sfp unit) for 1/scale computation
+        - Supports eager mode via compile_once decorator
     """
-    pass
+    return compiled(input, scale)
 
 
 @quantize_fp8_with_scale.register_fake
@@ -926,30 +945,67 @@ def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
 
 
+# NOTE: Do NOT add a second @torch.library.custom_op registration for this op.
+# A duplicate with a pass body was introduced in commit 8f2e78ff and silently
+# overwrote this implementation at import time, causing None returns in eager mode.
+@torch.library.custom_op(
+    "spyre::quantize_weight_fp8_with_scale", mutates_args=(), device_types="spyre"
+)
+@compile_once("spyre.quantize_weight_fp8_with_scale")
+def quantize_weight_fp8_with_scale(
+    input: torch.Tensor, scale: torch.Tensor, compiled
+) -> torch.Tensor:
+    """Quantize FP16 weight tensor to FP8 using a pre-computed scale.
+
+    Implements the four-step pipeline described above using qfp8wt for the
+    final format conversion (weight / kernel layout).
+
+    Args:
+        input: FP16 weight tensor to quantize
+        scale: Quantization scale (FP16)
+
+    Returns:
+        FP8 E4M3 tensor with the same shape as input.
+
+    Note:
+        - Supports eager mode via compile_once decorator
+    """
+    return compiled(input, scale)
+
+
+@quantize_weight_fp8_with_scale.register_fake
+def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # Output is FP8 with same shape as input
+    return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
+
+
 @torch.library.custom_op(
     "spyre::dequantize_fp8_with_scale", mutates_args=(), device_types="spyre"
 )
-def dequantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:  # type: ignore[empty-body]
+@compile_once("spyre.dequantize_fp8_with_scale")
+def dequantize_fp8_with_scale(
+    input: torch.Tensor, scale: torch.Tensor, compiled
+) -> torch.Tensor:
     """
     Dequantize FP8 tensor to FP16 using pre-computed scale.
+
     Performs two steps:
     1. Convert FP8 to FP16: x_fp16 = fp8todl16(x) (dtype conversion)
     2. Scale the output: x_scaled = x_fp16 * scale (POINTWISE)
+
     Args:
         input: Input tensor (FP8) to dequantize, shape [batch, seq, hidden]
         scale: Dequantization scale (FP16), shape [batch, seq, 1]
+
     Returns:
         FP16 tensor (same shape as input)
-    Example:
-        >>> @torch.compile(backend='inductor')
-        >>> def dequant(x_fp8, scale):
-        >>>     return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
+
     Note:
-        - MUST use torch.compile(backend='inductor') - does not work in eager mode
+        - Supports eager mode via compile_once decorator
         - Uses fp8todl16 operation for FP8→FP16 conversion
         - Scale must be FP16, NOT FP32
     """
-    pass
+    return compiled(input, scale)
 
 
 @dequantize_fp8_with_scale.register_fake
@@ -979,21 +1035,6 @@ def _(
 ) -> torch.Tensor:
     output_shape = [mat1.shape[0], mat2.shape[-1]]
     return mat1.new_empty(output_shape, dtype=out_dtype or torch.float16)
-
-
-@torch.library.custom_op(
-    "spyre::quantize_weight_fp8_with_scale", mutates_args=(), device_types="spyre"
-)
-def quantize_weight_fp8_with_scale(
-    input: torch.Tensor, scale: torch.Tensor
-) -> torch.Tensor:
-    pass
-
-
-@quantize_weight_fp8_with_scale.register_fake
-def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    # Output is FP8 with same shape as input
-    return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
 
 
 @torch.library.custom_op("spyre::qfp8wt", mutates_args=(), device_types="spyre")
@@ -1044,6 +1085,62 @@ def _(
     device: torch.device,
 ) -> torch.Tensor:
     return torch.empty(1, 1, seqlen_q, seqlen_kv, dtype=dtype, device=device)
+
+
+@torch.library.custom_op("spyre::triu_cpu", mutates_args=())
+def triu_cpu(input: torch.Tensor, diagonal: int) -> torch.Tensor:
+    """
+    CPU fallback for torch.triu on dtypes with no Spyre elementwise support.
+
+    The mask-multiply decomposition needs an elementwise mul, which the device
+    rejects for the narrow integral formats (uint8 -> SENUINT32, int8 ->
+    SENINT8, int32 -> IEEE_INT32); torch.where is rejected for the same
+    formats, so there is no on-device masking path at all.  Mirrors
+    max_dim_int64_fallback: the Spyre kernel is registered in fallbacks.py, and
+    this CompositeExplicitAutograd body computes the real result so calls with
+    non-Spyre inputs (e.g. compare_with_cpu paths) still work.
+    """
+    return torch.triu(input, diagonal)
+
+
+@triu_cpu.register_fake
+def _(input: torch.Tensor, diagonal: int) -> torch.Tensor:
+    return torch.empty_like(input)
+
+
+@torch.library.custom_op("spyre::triu_mask", mutates_args=())
+def triu_mask(
+    h: int,
+    w: int,
+    diagonal: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Build an upper triangular mask on CPU and transfer to the target device.
+
+    Shape: [H, W] in the input's dtype
+
+    Built entirely on CPU so the construction is opaque to torch.compile —
+    assert_functional_graph is satisfied and the compiled graph only sees the
+    resulting device tensor.  No device_types restriction is set because there
+    are no tensor arguments to dispatch on; the device is an explicit parameter.
+    """
+    cols = torch.arange(w, device="cpu", dtype=torch.int32).unsqueeze(0)  # [1, W]
+    rows = torch.arange(h, device="cpu", dtype=torch.int32).unsqueeze(1)  # [H, 1]
+    mask = ((cols - rows) >= diagonal).to(dtype=dtype)  # [H, W]
+    return mask.to(device=device)
+
+
+@triu_mask.register_fake
+def _(
+    h: int,
+    w: int,
+    diagonal: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.empty(h, w, dtype=dtype, device=device)
 
 
 @torch.library.custom_op(
@@ -1116,11 +1213,11 @@ def kv_window(  # type: ignore[empty-body]
     """
     Read one Q block's slice of the KV cache.
 
-    key/value: [B, Hkv, Lkv, E]. Returns (k_win, v_win) covering cache rows
-    [read_start, read_start + buffer_width). k_win is
-    [B, Hkv, E, buffer_width], already **transposed** -- the layout the scores
-    matmul wants, free on a slice. Both outputs retain the native KV-head count;
-    the attention decomposition broadcasts them across query-head groups.
+    key/value: [B, Hkv, Lkv, E]. Returns (k_win, v_win), both shaped
+    [B, Hkv, buffer_width, E], covering cache rows
+    [read_start, read_start + buffer_width). Both outputs retain the native
+    KV-head count; the attention decomposition broadcasts them across
+    query-head groups and transposes each bounded K tile at the matmul.
 
     One block per call; the memory planner reuses one window buffer across
     them, so the cost is buffer_width rows for any query length.
@@ -1168,7 +1265,7 @@ def _(
         raise Unsupported(f"kv_window: {reason}")
 
     batch, num_kvheads, _, head_dim = key.shape
-    k_win = key.new_empty((batch, num_kvheads, head_dim, buffer_width))
+    k_win = key.new_empty((batch, num_kvheads, buffer_width, head_dim))
     v_win = value.new_empty((batch, num_kvheads, buffer_width, head_dim))
     return k_win, v_win
 
@@ -1262,6 +1359,7 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
 mark_lx_safe(torch.ops.spyre.to_dtype_cpu.default)
 mark_lx_safe(torch.ops.spyre.unfold.default)
 mark_lx_safe(torch.ops.spyre.causal_mask.default)
+mark_lx_safe(torch.ops.spyre.triu_mask.default)
 # max_dim_int64_fallback/min_dim_int64_fallback/max_default_int64_fallback are
 # registered via ops/fallbacks.py's register_fallback, which already appends
 # them to fallback_ops -- _is_cpu_only_fallback (lx_context_switching.py)

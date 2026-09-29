@@ -17,8 +17,8 @@
 A relayout group's destination is a ``RelayoutCopyBuffer``: an ordinary buffer
 whose residency IS the decision to shuffle, placed by the same no-overlap as
 everything else and priced by a plain term of the shared sympy objective
-(``cost_term``). Handcrafted buffers drive the pieces directly - no graph, no
-compile:
+(``cost_term``, one ``RelayoutCharge`` node per copy). Handcrafted buffers
+drive the pieces directly - no graph, no compile:
 
 - the price term is solver-agnostic: evaluated by ``lambdify`` it charges the
   source's chosen division exactly when the copy is resident;
@@ -42,7 +42,9 @@ import sympy
 
 pytest.importorskip("ortools")
 
+from torch_spyre._inductor import config
 from torch_spyre._inductor.pass_utils import PerCoreView
+from torch_spyre._inductor.scratchpad import ilp_solver_ortools
 from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
 from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 from torch_spyre._inductor.scratchpad.lx_relayout import (
@@ -62,14 +64,33 @@ _CORE = sympy.Symbol("core_id")
 _PER_CORE = 16  # P is 64 bytes sliced 4 ways
 
 
-def _view(slot: int) -> PerCoreView:
-    """A 4-way per-core view of device dim 1; ``slot`` rotates the ownership so
-    distinct slots are distinct (relayout-compatible) views."""
-    return PerCoreView(((1, 4),), ((1, sympy.Mod(_CORE + slot, 4)),), 4)
+@pytest.mark.parametrize(
+    "cap,costs,expected",
+    [(1, {0: 10000, 1: 1000}, [1]), (1, None, [0]), (0, {0: 10000, 1: 1000}, [0, 1])],
+)
+def test_relayout_shortlist_prices_the_consumer(monkeypatch, cap, costs, expected):
+    """Saving 500 ns on a copy must not hide a 9000 ns faster consumer."""
+    monkeypatch.setattr(config, "lx_solver_relayout_groups_per_edge", cap)
+    candidates = [
+        _candidate("C", 0, 500, group=0, j=0),
+        _candidate("C", 0, 1000, group=1, j=1),
+    ]
+    divisions = [CoreDivision(splits={sympy.Symbol("d0"): 4})] * 2
+    kept = CoOptimizingAllocator._cap_relayout_groups(
+        "P", "C", candidates, divisions, costs
+    )
+    assert [c.group for c in kept] == expected
+
+
+def _view(slot: int, num_cores: int = 4) -> PerCoreView:
+    """A 4-way per-core view of device dim 1 on ``num_cores`` cores; ``slot``
+    rotates the ownership so distinct slots are distinct (relayout-compatible)
+    views. More cores than owners is a broadcast destination."""
+    return PerCoreView(((1, 4),), ((1, sympy.Mod(_CORE + slot, 4)),), num_cores)
 
 
 def _candidate(
-    consumer, i, cost_ns, group=0, j=0, destination_span=16
+    consumer, i, cost_ns, group=0, j=0, destination_span=16, destination_cores=4
 ) -> RelayoutCandidate:
     """The priced candidate the allocator would enumerate for P -> consumer under
     source division ``i`` / consumer division ``j``, landing on destination
@@ -83,7 +104,7 @@ def _candidate(
         consumer_division=j,
         group=group,
         source_view=_view(0),
-        destination_view=_view(group + 1),
+        destination_view=_view(group + 1, destination_cores),
         cost_ns=cost_ns,
         # P is 64 bytes over 4 cores; a permutation of an outer split keeps
         # the equal share as its per-core span on both sides.
@@ -148,6 +169,57 @@ def _disjoint(a_addr, b_addr, footprint=_PER_CORE) -> bool:
     return not (a_addr < b_addr + footprint and b_addr < a_addr + footprint)
 
 
+@pytest.mark.parametrize("priced", [False, True])
+def test_relayout_solve_presolves_by_default(monkeypatch, priced):
+    from ortools.sat.python import cp_model
+
+    p = _producer([0, 1])
+    c = _consumer("C", 1, 2, [_candidate("C", 0, 5000.0)])
+    buffers = _with_copies(p, c)
+    original = cp_model.CpSolver.Solve
+    parameters = []
+
+    def solve(solver, model, *args, **kwargs):
+        parameters.append(solver.parameters.cp_model_presolve)
+        assert solver.parameters.max_time_in_seconds == config.cpsat_time_limit_seconds
+        return original(solver, model, *args, **kwargs)
+
+    monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
+    result = _solve(buffers, expr=_objective(buffers) if priced else None)
+    assert parameters and all(parameters)
+    assert (_copy(result).address is not None) == priced
+
+
+@pytest.mark.parametrize("deterministic,expected_workers", [(False, 96), (True, 1)])
+def test_relayout_solve_uses_available_parallel_search_workers(
+    monkeypatch, deterministic, expected_workers
+):
+    """Only deterministic mode restricts CP-SAT's parallel search portfolio."""
+    from ortools.sat.python import cp_model
+
+    p = _producer([0, 1])
+    c = _consumer("C", 1, 2, [_candidate("C", 0, 5000.0)])
+    buffers = _with_copies(p, c)
+    original = cp_model.CpSolver.Solve
+    workers = []
+
+    monkeypatch.setattr(ilp_solver_ortools, "get_cpu_count", lambda: 96)
+    monkeypatch.setattr(
+        ilp_solver_ortools.torch,
+        "are_deterministic_algorithms_enabled",
+        lambda: deterministic,
+    )
+
+    def solve(solver, model, *args, **kwargs):
+        workers.append(solver.parameters.num_search_workers)
+        assert solver.parameters.share_level_zero_bounds
+        return original(solver, model, *args, **kwargs)
+
+    monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
+    _solve(buffers, expr=_objective(buffers))
+    assert workers == [expected_workers]
+
+
 # ---------------------------------------------------------------------------
 # The copy buffer and its generic price term
 # ---------------------------------------------------------------------------
@@ -189,6 +261,66 @@ def test_copy_is_sized_by_the_destination_span_not_the_source_share():
     c3 = _consumer("C3", 2, 3, [_candidate("C3", 0, 5000.0, destination_span=32)])
     with pytest.raises(AssertionError, match="mixes destination spans"):
         CoOptimizingAllocator._relayout_copy_buffers([p, c1, c3])
+
+
+def test_a_broadcast_copy_lives_on_the_destination_cores():
+    """A source on 4 cores feeding a matmul on 8 (#3440 broadcast): the copy is
+    the destination, so it is sliced the destination's way, one span per
+    destination core, while the plan keeps the source's core count."""
+    p = _producer([0, 3])
+    c = _consumer(
+        "C",
+        1,
+        2,
+        [_candidate("C", 0, 5000.0, destination_span=48, destination_cores=8)],
+    )
+    (copy,) = CoOptimizingAllocator._relayout_copy_buffers([p, c])
+    assert copy.num_cores == 8 and copy.size == 48 * 8 and copy.min_footprint == 48
+    (group,) = FiredRelayoutGroup.from_chosen(
+        [ChosenRelayout(_candidate("C", 0, 5000.0, destination_cores=8), 16)]
+    )
+    plan = group.plan(source_address=0)
+    assert plan.num_cores == 4, "the plan's core count is the source's (#3440)"
+    assert plan.destination_view.num_cores == 8
+    with pytest.raises(ValueError, match="not a multiple"):
+        _candidate("C", 0, 5000.0, destination_cores=6)
+    with pytest.raises(ValueError, match="no physical core count"):
+        RelayoutCandidate("P", "C", 0, 0, 0, _view(0), _view(1, None), 1.0, 16, 16)
+    with pytest.raises(AssertionError, match="mixes destination core counts"):
+        CoOptimizingAllocator._relayout_copy_buffers(
+            [p, c, _consumer("D", 1, 2, [_candidate("D", 0, 5000.0)])]
+        )
+
+
+def test_one_destination_may_be_fed_from_sources_on_different_core_counts():
+    """A producer's division menu spans core counts; under broadcast admission
+    several of its divisions can land on the same 32-core matmul view. The copy
+    is that view, so it is built once, and each source division keeps its own
+    price in the table."""
+    p = _producer([0, 3], divisions=2)
+    c = _consumer(
+        "C",
+        1,
+        2,
+        [
+            _candidate("C", 0, 5000.0, destination_cores=8),  # source on 4 cores
+            RelayoutCandidate(
+                parent="P",
+                consumer="C",
+                source_division=1,
+                consumer_division=0,
+                group=0,
+                source_view=_view(0, 2),  # a source division on 2 cores
+                destination_view=_view(1, 8),
+                cost_ns=3000.0,
+                source_footprint_bytes=32,
+                destination_footprint_bytes=16,
+            ),
+        ],
+    )
+    (copy,) = CoOptimizingAllocator._relayout_copy_buffers([p, c])
+    assert copy.num_cores == 8 and copy.size == 16 * 8
+    assert copy.cost_by_source_division == {0: 5000.0, 1: 3000.0}
 
 
 def test_plan_carries_the_measured_spans():
@@ -421,7 +553,7 @@ def test_copy_spans_a_consumer_outside_the_group():
 def test_charge_follows_the_chosen_source_division():
     """P offers two divisions whose shuffles into the same destination view
     price differently (5000 vs 3000 ns). The solver picks the cheaper source
-    division, and the KroneckerDelta term charges that price: with the
+    division, and the RelayoutCharge term charges that price: with the
     spill at 4000 only the cheaper division makes the relayout worth it."""
     bufs = _with_copies(
         _producer([0, 3], divisions=2),

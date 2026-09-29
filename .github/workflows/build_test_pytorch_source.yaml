@@ -60,7 +60,7 @@ jobs:
       - x86_64
       - spyre_pf_x1
       - linux
-      - image_spyre_backend
+      - image_spyre_backend_release
     timeout-minutes: 180
     env:
       # GitHub Actions sets CI=true which causes pytest inductor tests to fail.
@@ -92,6 +92,12 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           path: torch-spyre
+          # setuptools_scm derives the version from git history, so the wheel
+          # build needs the tags and the commits back to the last one. The
+          # default fetch-depth 1 (with fetch-tags false) leaves zero tags
+          # visible, which silently yields a 0.1.devN version instead of one
+          # based on the latest release tag.
+          fetch-depth: 0
 
       - name: Checkout pytorch@${{ inputs.pytorch_sha }}
         uses: ./.github/actions/checkout-pytorch
@@ -276,8 +282,8 @@ jobs:
       - x86_64
       - spyre_pf_x0
       - linux
-      - image_spyre_backend
-    timeout-minutes: 660 # accomodate atleast 2 full sized attempts 
+      - image_spyre_backend_release
+    timeout-minutes: 660 # accomodate atleast 2 full sized attempts
     permissions:
       # Needed to dispatch and poll _upstream_tests_beta_matrix.yaml below
       # (createWorkflowDispatch / listWorkflowRuns / getWorkflowRun). Capped
@@ -392,6 +398,7 @@ jobs:
                 mode: 'validate',
                 correlation_id: correlationId,
                 source_run_id: `${context.runId}`,
+                image_label: 'image_spyre_backend_release',
               },
             });
 
