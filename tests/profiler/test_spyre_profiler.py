@@ -1432,15 +1432,11 @@ def _find_runtime_device_pair_errors(events):
         correlation = runtime_args.get("correlation")
 
         if correlation is None:
-            errors.append(
-                f"{runtime_name}: missing correlation ID"
-            )
+            errors.append(f"{runtime_name}: missing correlation ID")
             continue
 
         if correlation in runtime_correlations:
-            errors.append(
-                f"duplicate runtime correlation ID {correlation}"
-            )
+            errors.append(f"duplicate runtime correlation ID {correlation}")
             continue
 
         runtime_correlations.add(correlation)
@@ -1461,8 +1457,7 @@ def _find_runtime_device_pair_errors(events):
 
         if not correlated_device_events:
             errors.append(
-                f"{runtime_name} correlation {correlation}: "
-                "no correlated device event"
+                f"{runtime_name} correlation {correlation}: no correlated device event"
             )
             continue
 
@@ -1481,8 +1476,7 @@ def _find_runtime_device_pair_errors(events):
 
         if not correct_type:
             actual_types = ", ".join(
-                event.get("cat", "unknown")
-                for event in correlated_device_events
+                event.get("cat", "unknown") for event in correlated_device_events
             )
             errors.append(
                 f"{runtime_name} correlation {correlation}: "
@@ -1501,8 +1495,7 @@ def _find_runtime_device_pair_errors(events):
 
             if not matching_events:
                 actual_calls = ", ".join(
-                    str((event.get("args") or {}).get("call"))
-                    for event in correct_type
+                    str((event.get("args") or {}).get("call")) for event in correct_type
                 )
                 errors.append(
                     f"{runtime_name} correlation {correlation}: "
