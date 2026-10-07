@@ -1403,6 +1403,41 @@ def test_duplicate_kernel_start_timestamps(tmp_path):
         )
 
 
+@pytest.mark.requires_spyre_profiler
+def test_runtime_events_emitted_on_multiple_thread_rows():
+    """Runtime activities are attributed to the flex thread that emitted them,
+    so they span more than one thread row instead of collapsing onto one."""
+    cpu_src = torch.randn(64, 64, dtype=torch.float16)
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        device_tensor = cpu_src.to("spyre")
+        _ = device_tensor + device_tensor
+        _ = device_tensor.cpu()
+        torch.spyre.synchronize()
+
+    with TemporaryFileName(mode="w+") as fname:
+        prof.export_chrome_trace(fname)
+        with open(fname) as f:
+            trace = json.load(f)
+
+    events = trace.get("traceEvents", [])
+    runtime_tids = {
+        e["tid"]
+        for e in events
+        if e.get("cat") == "privateuse1_runtime" and e.get("ph") == "X"
+    }
+
+    assert runtime_tids, (
+        "Expected at least one runtime event in the AIUPTI-backed trace"
+    )
+    assert len(runtime_tids) > 1, (
+        f"Runtime events all landed on tid(s) {sorted(runtime_tids)}; "
+        "expected more than one thread row"
+    )
+
+
 _RUNTIME_DEVICE_PAIRS = {
     "aiuLaunchDMIControlBlocks": ("gpu_memcpy", "HtoD"),
     "aiuLaunchDMOControlBlocks": ("gpu_memcpy", "DtoH"),
@@ -1512,6 +1547,11 @@ def _find_runtime_device_pair_errors(events):
             continue
 
         device_event = matching_events[0]
+
+        # Kernel timestamp ordering is validated separately in #4801.
+        if runtime_name == "aiuLaunchControlBlocks":
+            continue
+
         runtime_ts = runtime_event.get("ts")
         device_ts = device_event.get("ts")
 
@@ -1678,15 +1718,15 @@ def test_runtime_device_correlation_pairs():
             [
                 {
                     "cat": "privateuse1_runtime",
-                    "name": "aiuLaunchControlBlocks",
+                    "name": "aiuLaunchDMIControlBlocks",
                     "ts": 200,
                     "args": {"correlation": 60},
                 },
                 {
-                    "cat": "kernel",
-                    "name": "early_kernel",
+                    "cat": "gpu_memcpy",
+                    "name": "Memcpy (HtoD)",
                     "ts": 190,
-                    "args": {"correlation": 60},
+                    "args": {"correlation": 60, "call": "HtoD"},
                 },
             ],
             "device event starts before runtime launch",
@@ -1729,15 +1769,15 @@ def test_runtime_device_correlation_pairs():
             [
                 {
                     "cat": "privateuse1_runtime",
-                    "name": "aiuLaunchControlBlocks",
+                    "name": "aiuLaunchDMIControlBlocks",
                     "ts": float("nan"),
                     "args": {"correlation": 81},
                 },
                 {
-                    "cat": "kernel",
-                    "name": "synthetic_kernel",
+                    "cat": "gpu_memcpy",
+                    "name": "Memcpy (HtoD)",
                     "ts": 110,
-                    "args": {"correlation": 81},
+                    "args": {"correlation": 81, "call": "HtoD"},
                 },
             ],
             "invalid runtime timestamp",
@@ -1746,15 +1786,15 @@ def test_runtime_device_correlation_pairs():
             [
                 {
                     "cat": "privateuse1_runtime",
-                    "name": "aiuLaunchControlBlocks",
+                    "name": "aiuLaunchDMIControlBlocks",
                     "ts": 100,
                     "args": {"correlation": 82},
                 },
                 {
-                    "cat": "kernel",
-                    "name": "synthetic_kernel",
+                    "cat": "gpu_memcpy",
+                    "name": "Memcpy (HtoD)",
                     "ts": float("inf"),
-                    "args": {"correlation": 82},
+                    "args": {"correlation": 82, "call": "HtoD"},
                 },
             ],
             "invalid device timestamp",
@@ -1794,7 +1834,7 @@ def test_runtime_device_correlation_pair_errors(events, expected_error):
 
 @pytest.mark.requires_spyre_profiler
 def test_out_of_order_event_sequence(tmp_path):
-    """Verify Spyre runtime launches precede their correlated device events."""
+    """Verify Spyre runtime-to-device correlation validation on a hardware trace."""
     trace_file = tmp_path / "out_of_order_event_sequence_trace.json"
 
     x = torch.randn((64, 64), dtype=torch.float16, device="spyre")
@@ -1825,7 +1865,7 @@ def test_out_of_order_event_sequence(tmp_path):
 
     assert runtime_events, (
         "Expected at least one correlated Spyre runtime launch "
-        "for event-order validation"
+        "for runtime/device correlation validation"
     )
 
     if errors:
