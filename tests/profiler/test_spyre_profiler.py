@@ -1548,7 +1548,7 @@ def _find_runtime_device_pair_errors(events):
 
         device_event = matching_events[0]
 
-        # Kernel timestamp ordering is validated separately in #4801.
+        # Kernel timestamp ordering is covered by the shifted timestamp validation.
         if runtime_name == "aiuLaunchControlBlocks":
             continue
 
