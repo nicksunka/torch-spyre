@@ -1833,19 +1833,22 @@ def test_runtime_device_correlation_pair_errors(events, expected_error):
 
 
 @pytest.mark.requires_spyre_profiler
-def test_out_of_order_event_sequence(tmp_path):
+def test_runtime_device_correlation_on_trace(tmp_path):
     """Verify Spyre runtime-to-device correlation validation on a hardware trace."""
-    trace_file = tmp_path / "out_of_order_event_sequence_trace.json"
+    trace_file = tmp_path / "runtime_device_correlation_trace.json"
 
-    x = torch.randn((64, 64), dtype=torch.float16, device="spyre")
-    y = torch.randn((64, 64), dtype=torch.float16, device="spyre")
+    x_cpu = torch.randn((64, 64), dtype=torch.float16)
+    y_cpu = torch.randn((64, 64), dtype=torch.float16)
 
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
     ) as prof:
+        x = x_cpu.to("spyre")
+        y = y_cpu.to("spyre")
         result = torch.matmul(x, y)
         result = F.gelu(result)
         result = torch.sum(result)
+        result.cpu()
         torch.spyre.synchronize()
 
     prof.export_chrome_trace(str(trace_file))
@@ -1863,9 +1866,16 @@ def test_out_of_order_event_sequence(tmp_path):
 
     runtime_events, errors = _find_runtime_device_pair_errors(trace_events)
 
-    assert runtime_events, (
-        "Expected at least one correlated Spyre runtime launch "
-        "for runtime/device correlation validation"
+    runtime_names = {event.get("name") for event in runtime_events}
+    expected_runtime_names = {
+        "aiuLaunchDMIControlBlocks",
+        "aiuLaunchDMOControlBlocks",
+        "aiuLaunchControlBlocks",
+    }
+
+    assert expected_runtime_names.issubset(runtime_names), (
+        "Expected all Spyre runtime launch types for runtime/device correlation "
+        f"validation; missing: {sorted(expected_runtime_names - runtime_names)}"
     )
 
     if errors:
