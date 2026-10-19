@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 import sympy
 from torch._inductor.dependencies import MemoryDep
-from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
+from torch._inductor.ir import ComputedBuffer, Pointwise, Reduction
 from torch._inductor.virtualized import V
 
 from .. import config
@@ -42,6 +42,7 @@ from ..pass_utils import (
 )
 from ..work_division import MAX_SPAN_BYTES
 from .coarse_tile import _loop_var_hinted_ranges, _stick_host_dim
+from .tile import compute_tile_stride
 
 
 logger = get_inductor_logger("wsr.span_overflow_hint_analysis")
@@ -213,6 +214,7 @@ def _post_tile_layout_for_splits(
     original_layout: FixedTiledLayout,
     split_by_host_dim: dict[int, int],
     op_name: str,
+    stick_host_dim: int | None,
 ) -> FixedTiledLayout:
     """Build the actual per-tile Spyre layout for one or more host splits.
 
@@ -252,13 +254,21 @@ def _post_tile_layout_for_splits(
             )
         new_size[selected_host_dim] = full_size // split_count
 
-    new_stride = list(FlexibleLayout.contiguous_strides(new_size))
+    try:
+        new_stride = compute_tile_stride(
+            original_layout.size, original_layout.stride, new_size
+        )
+    except Unsupported as exc:
+        raise Unsupported(f"Cannot auto-tile {op_name}: {exc}") from exc
 
     try:
         device_layout = _resize_device_layout(
             original_layout.device_layout,
             [int(s) for s in original_layout.size],
             [int(s) for s in new_size],
+            stick_host_dim=stick_host_dim,
+            old_host_stride=[int(s) for s in original_layout.stride],
+            new_host_stride=[int(s) for s in new_stride],
         )
     except RuntimeError as exc:
         raise Unsupported(
@@ -362,11 +372,18 @@ def _post_tile_resize_error(
     ):
         return None
     full_size = [concretize_expr(s) for s in layout.size]
+    full_stride = [concretize_expr(s) for s in layout.stride]
     tile_size = list(full_size)
     tile_size[host_dim] //= split_count
     try:
+        tile_stride = compute_tile_stride(full_size, full_stride, tile_size)
         _resize_device_layout(
-            layout.device_layout, full_size, tile_size, stick_host_dim=stick_host_dim
+            layout.device_layout,
+            full_size,
+            tile_size,
+            stick_host_dim=stick_host_dim,
+            old_host_stride=full_stride,
+            new_host_stride=[int(s) for s in tile_stride],
         )
     except RuntimeError as exc:
         return str(exc)
@@ -668,7 +685,7 @@ def _coordinate_span_elems(
         if range_size % split_count != 0:
             return None
         range_size //= split_count
-        term = coord.subs({other: 0 for other in coord.free_symbols - {sym}})
+        term = coord.subs(dict.fromkeys(coord.free_symbols - {sym}, 0))
         if term.has(sympy.Mod):
             mod_atoms = term.atoms(sympy.Mod)
             if any(mod.args[0] != sym for mod in mod_atoms):
@@ -1048,21 +1065,26 @@ def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
       restricts *tiling* ``max``/``min`` to floating point (their identity is
       +/-inf, which cast wrong into an integer accumulator), but an integer
       max/min's reduction-only overflow is exactly as unfixable as a float
-      one's -- ``_K_SPLIT_COMBINE_SUPPORTED`` pins plain reduction vars to
-      split=1 regardless of dtype -- so this check must still fire for it, or
-      that overflow is silently dropped instead.  Everything outside the
-      family -- matmul (incl. fp8), conv, top-k, welford -- is owned by
-      another pass (work division cross-core splits matmul/conv/pool/top-k K
-      via ``_K_SPLIT_COMBINE_SUPPORTED``) or has no combine path here at all,
-      and must keep its historical silent-skip;
+      one's -- ``plain_reduction_k_split_domains`` pins plain reduction vars
+      to split=1 regardless of dtype -- so this check
+      must still fire for it, or that overflow is silently dropped instead.
+      Everything outside the family -- matmul (incl. fp8), conv, top-k,
+      welford -- is owned by another pass (work division cross-core splits
+      matmul/conv/pool/top-k K) or has no combine path here at all, and must
+      keep its historical silent-skip;
     * the overflowing coordinate itself is controlled only by reduction
       symbols, so no output-range tile touches it;
     * the span still exceeds the limit in the *best case* computed by
       ``_best_case_inner_span``, which is more aggressive than any
       output-range coarse tile or any N-way work-division core split, so if
       even that leaves the span over the limit, no output mechanism can close
-      it -- only a reduction-range split, which this op cannot do
-      (``_K_SPLIT_COMBINE_SUPPORTED`` also excludes plain reductions).
+      it -- only a reduction-range split, which this op cannot do.
+
+    Reduction-range coarse tiling is distinct from a cross-core K-split.
+    Types supported by WSR (``sum``, ``prod``, float ``max``/``min``) exit via
+    ``_supports_reduction_range_tiling`` at the top of this function. The
+    types that do reach here (``mean``, integer ``max``/``min``) have no such
+    recovery path.
 
     ``max_cores`` is therefore not consulted: the best case already bounds
     every core-split outcome.
@@ -1075,9 +1097,9 @@ def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
     ``plan_span_overflow_tile``), unaffected by the config check here.
 
     Without this check (and when not disabled) the span is silently dropped,
-    ``span_reduction_pass`` cannot split the reduced axis either (plain
-    reductions are pinned to split=1), and the op reaches the backend over the
-    limit.
+    ``span_reduction_pass`` cannot split the reduced axis either (multi-dim
+    plain reductions are pinned to split=1), and the op reaches the backend
+    over the limit.
     """
     if not isinstance(op.data, Reduction) or _supports_reduction_range_tiling(op):
         return False
@@ -1108,7 +1130,7 @@ def _has_untileable_reduction_span(op: ComputedBuffer, max_cores: int) -> bool:
             syms = coord.free_symbols
             if not syms or any(sym in symbol_to_dim for sym in syms):
                 continue
-            span_elems = _coordinate_span_elems(coord, dep, {sym: 1 for sym in syms})
+            span_elems = _coordinate_span_elems(coord, dep, dict.fromkeys(syms, 1))
             if span_elems is None:
                 continue
             best_inner = _best_case_inner_span(
@@ -1827,6 +1849,7 @@ def _remaining_span_candidates_after_tile(
         op.layout,
         split_by_host_dim,
         op.get_name(),
+        _stick_host_dim(op, op.layout.device_layout),
     )
     remaining = _output_span_candidates_from_op(
         op,
@@ -2328,12 +2351,13 @@ def plan_span_overflow_tile(
             # it.
             #
             # The BMM exemption is not arbitrary: work division cross-core
-            # splits a matmul's K range (BATCH_MATMUL_OP is in
-            # work_division_constraints._K_SPLIT_COMBINE_SUPPORTED), so a
-            # BMM K-only rejection here is genuinely recoverable downstream and
-            # keeps its historical None.  Plain sum/prod/max/min are pinned to
-            # split=1 there and have no such recovery, so dropping their
-            # overflow just defers the failure to the backend.
+            # splits a matmul's K range, so a BMM K-only rejection here is
+            # genuinely recoverable downstream and keeps its historical None.
+            # Plain sum/prod/max/min that support reduction-range tiling are
+            # handled by _has_untileable_reduction_span returning False early.
+            # The types that reach here (mean, integer max/min) have no K-split
+            # recovery, so dropping their overflow just defers the failure to
+            # the backend.
             raise Unsupported(
                 f"Cannot auto-tile {op.get_name()}: the reduced axis overflows "
                 "and no legal, stick-aligned reduction-range split within "

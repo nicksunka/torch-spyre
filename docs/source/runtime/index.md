@@ -252,11 +252,13 @@ Three ordered `RuntimeOperation`s on a stream: a CPU callback computes the corre
    tensor's `kAddress` symbolic argument is populated by calling
    `get_composite_address()` on the corresponding context tensor, and the
    resulting `flex::CompositeAddress` values are passed to
-   `flex::createHostComputeParams()` as the host-compute argument list. Each
-   `kAddress` slot is then resolved to a concrete HBM device address through
-   `compositeAddressToDeviceAddress()` on that tensor, using the allocator's
-   region map. The resolved address is what the correction blob carries, so it
-   stays correct regardless of where the allocator placed each tensor.
+   `flex::createHostComputeParams()` as the host-compute argument list.
+   torch-spyre passes these composite addresses rather than resolving them in
+   `construct()`; flex resolves each `kAddress` slot to a concrete device
+   address when it builds the correction, following the
+   `SymbolicArgKind::kAddress` contract (`compositeAddressToDeviceAddress()` in
+   `csrc/job_plan.h`). The correction blob therefore carries the resolved
+   addresses regardless of where the allocator placed each tensor.
 2. **`JobPlanStepH2D`** copies that buffer into the program region on the device.
 3. **`JobPlanStepCompute`** then runs the kernel. The device-side prologue
    reads the corrections, patches the symbolic operands, and starts execution.
@@ -332,6 +334,13 @@ unsupported: the protocol overhead is high and call sites are rare.
 to a single Spyre device (typically `torch.device(f"spyre:{os.getenv('RANK', '0')}")`
 in the user code). The backend reuses the rank's existing flex runtime instance
 and default stream. It does not own a separate runtime context.
+
+### Compiled collectives and streams
+
+In compiled graphs, `wait_tensor` blocks the host until the collective
+finishes. Set `TORCH_SPYRE_DIST_ENFORCE_WAIT=1` to enforce that wait;
+when unset the wait is skipped and ordering relies on the
+default stream, where `spyre_comms` runs every collective.
 
 ## More in This Section
 

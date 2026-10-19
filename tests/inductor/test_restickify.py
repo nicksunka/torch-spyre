@@ -29,7 +29,6 @@ import pytest
 from unittest.mock import patch
 
 import torch
-import torch.nn.functional as F
 from torch._inductor.virtualized import V
 from torch.spyre import SpyreTensorLayout
 
@@ -793,17 +792,8 @@ def test_two_mutations_read_between_writes_minimal_copy_():
     _compare(fn, a, b, acc)
 
 
-@pytest.mark.skip(
-    reason="crashes in _clone_layout (propagate_layouts) before the conflicting-layout "
-    "assert fires: `return snapshot * acc` forces a flat 1D clone of acc (size=[32768]) "
-    "between the two writes; device_coordinates on the col-stick acc via that flat index "
-    "produces the unsupported stick expr floor((Mod(d0,16384))/256). Issue #4093"
-)
 def test_two_mutations_read_between_writes_v2_copy_f():
     # write / read / write returning snapshot * acc (both outputs live).
-    # Skipped: `return snapshot * acc` forces a flat 1D clone of acc between the
-    # two writes; device_coordinates on the col-stick acc via that flat index
-    # produces an unsupported stick expression in _clone_layout.
     M, N = 128, 256
     a = torch.randn((N, M), dtype=torch.float16) * 0.01  # a.t() is MxN col-stick
     b = torch.randn((M, N), dtype=torch.float16) * 0.01  # MxN row-stick
@@ -914,45 +904,6 @@ def test_opt_chained_matmuls():
     """(a @ b) @ c — no restickify needed."""
     a, b, c = _make_tensors(3, S, S)
     _compare(lambda a, b, c: (a @ b) @ c, a, b, c, optimal_cost=0)
-
-
-def test_fused_attention_projection_uses_exact_flat_m_layout():
-    """Issue #4746: a fused shared-weight o_proj must not retain B,L BMM axes."""
-    B, H, L, D = 2, 2, 64, 64
-    M, K = B * L, H * D
-    q, k, v = _make_tensors(3, B, H, L, D)
-    weight = torch.randn((K, K), dtype=torch.float16) * 0.1
-
-    def fn(q, k, v, weight):
-        attention = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=0.0, scale=D**-0.5
-        )
-        flat = attention.transpose(1, 2).reshape(M, K)
-        return F.linear(flat, weight)
-
-    result, plan = _compile_and_run_plan_capture(fn, q, k, v, weight)
-    target_stls = [
-        entry.target_layout.device_layout
-        for entries in plan.values()
-        for entry in entries
-    ]
-
-    assert any(
-        list(layout.device_size) == [K // 64, M, 64]
-        and list(layout.stride_map) == [64, K, 1]
-        for layout in target_stls
-    ), f"expected an exact flat-M restickify target, got {target_stls}"
-    compare_with_cpu(
-        fn,
-        q,
-        k,
-        v,
-        weight,
-        target=result,
-        run_eager=False,
-        atol=0.2,
-        rtol=0.2,
-    )
 
 
 def test_opt_two_independent_conflicts():
@@ -2782,4 +2733,141 @@ def test_nonstick_reorder_pointwise_into_matmul():
     assert reordered_any, (
         f"Expected at least one buffer with largest non-stick dim in slot n-2. "
         f"nonstick_log={[(k, list(v.device_size)) for k, v in nonstick_log.items()]}"
+    )
+
+
+def test_nonstick_flat_dense_projection_collapses_outer_dims():
+    """NDO collapses a fused SDPA output from [B,L,H,D] to flat [M,K] for o_proj.
+
+    A fused attention producer retains a higher-rank host view [B, H, L, D]
+    that the downstream dense projection reads as the flat 2-D matrix [M, K]
+    where M=B*L and K=H*D. Without the flat-M transform, the backend encodes
+    this as a BMM. NDO must detect the pattern and collapse committed_stl to
+    the canonical flat-M shape.
+    """
+    import torch.nn.functional as F
+
+    B, H, L, D = 2, 2, 64, 64
+    M, K = B * L, H * D
+
+    q, k, v = _make_tensors(3, B, H, L, D)
+    weight = torch.randn((K, K), dtype=torch.float16) * 0.1
+
+    def fn(q, k, v, weight):
+        attention = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=0.0, scale=D**-0.5
+        )
+        flat = attention.transpose(1, 2).reshape(M, K)
+        return F.linear(flat, weight)
+
+    spyre_result, _, nonstick_log = _compile_and_run_nonstick_capture(
+        fn,
+        q.to(DEVICE),
+        k.to(DEVICE),
+        v.to(DEVICE),
+        weight.to(DEVICE),
+    )
+
+    assert nonstick_log, "expected NDO to rewrite at least one buffer"
+    flat_m_found = any(
+        list(stl.device_size) == [K // 64, M, 64] for stl in nonstick_log.values()
+    )
+    assert flat_m_found, (
+        f"expected flat-M device_size=[{K // 64}, {M}, 64] in nonstick_log, "
+        f"got {[(k, list(v.device_size)) for k, v in nonstick_log.items()]}"
+    )
+    compare_with_cpu(
+        fn,
+        q,
+        k,
+        v,
+        weight,
+        target=spyre_result,
+        run_eager=False,
+        atol=0.2,
+        rtol=0.2,
+    )
+
+
+# Regression coverage for bounded outer non-stick steps (issue #5388).
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "shape,step,start",
+    [
+        ((2, 97, 256), 3, 0),
+        ((2, 96, 256), 3, 0),
+        ((1, 97, 256), 3, 0),
+        ((2, 98, 256), 5, 0),
+        ((2, 97, 256), 3, 1),
+        ((2, 7, 3, 128), 3, 0),
+    ],
+)
+def test_bounded_nonstick_slice(shape, step, start, dtype):
+    # Small dyadic values survive device conversion exactly; a wrong row or
+    # batch must fail an exact comparison instead of hiding in a tolerance.
+    gen = torch.Generator().manual_seed(5388)
+    x = torch.randint(-16, 17, shape, generator=gen).to(dtype) / 8
+
+    def fn(t):
+        return t[:, start::step, ...] + 1
+
+    got = torch.compile(fn, dynamic=False, fullgraph=True)(x.to("spyre")).cpu()
+    torch.testing.assert_close(got, fn(x), atol=0, rtol=0)
+
+
+def test_matmul_weight_with_factorized_contraction_dim():
+    """A computed weight ``[N, Ht, D]`` reshaped to ``[N, Ht * D]`` feeds a matmul.
+
+    The contraction dim K is factorized over two host dims, so K appears in more
+    than one outer device coordinate once the stick moves to N.  The restickify
+    target must keep both dims (here 8 heads), and the matmul needs K collapsed
+    into one outer dim.  Issue #5550: the target layout used to overwrite the
+    heads dim, giving a layout with 8x too many elements and wrong values.
+    """
+    import torch.nn.functional as F
+
+    hidden, Ht, D = 4096, 8, 128
+    generator = torch.Generator().manual_seed(0)
+    x = torch.randn(1, 1, Ht * D, dtype=torch.float16, generator=generator)
+    w3 = torch.randn(hidden, Ht, D, dtype=torch.float16, generator=generator) * 0.05
+
+    def fn(x, w3):
+        # ``+ 0`` makes the weight a computed buffer with layout [N, Ht, D].
+        return F.linear(x, (w3 + 0).reshape(hidden, Ht * D))
+
+    compare_with_cpu(fn, x, w3, run_eager=False)
+
+
+def test_restickify_target_is_infeasible_when_the_old_stick_is_factorized():
+    """Moving the stick off a factorized contraction var is not computable.
+
+    The weight ``[N, 8, 128]`` has its K var ``d1`` on the heads dim, the D-high
+    dim and the stick.  There is no single outer dim to repurpose when the stick
+    moves to N, and repurposing the first one overwrites the heads dim.  The
+    target must be reported infeasible (``None``) instead of a layout whose device
+    size no longer matches the tensor (issue #5550).
+    """
+    import sympy
+    from torch._inductor.ir import FixedLayout
+    from torch_spyre._C import DataFormats, SpyreTensorLayout as _CSTL
+    from torch_spyre._inductor.pass_utils import compute_restickify_target_layout
+
+    d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+    host = FixedLayout(DEVICE, torch.float16, [4096, 8, 128], [1024, 128, 1])
+    stl = _CSTL(
+        [8, 2, 4096, 64],
+        [128, 64, 1024, 1],
+        DataFormats.SEN169_FP16,
+        {(0,): 8, (1, 3): 128, (2,): 4096},
+    )
+    host_coords = [d0, sympy.floor(d1 / 128), sympy.Mod(d1, 128)]
+    device_coords = [
+        sympy.floor(d1 / 128),
+        sympy.floor(sympy.Mod(d1, 128) / 64),
+        d0,
+        sympy.Mod(d1, 64),
+    ]
+    assert (
+        compute_restickify_target_layout(stl, host, d0, host_coords, device_coords)
+        is None
     )

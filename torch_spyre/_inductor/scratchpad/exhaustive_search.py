@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import math
 import time
 from collections.abc import Sequence
-from typing import Callable, Optional, cast
+from typing import ClassVar, Optional, cast
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
@@ -47,17 +48,68 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
     :meth:`plan_layout` call; ``cd_parent_matches`` (precomputed by
     :class:`CoOptimizingAllocator`) replaces the graph-level ``get_ncores`` check
     that was previously rerun per leaf on graph mutations.
+
+    The inner solver is a class parameter, so that the wrapper is a class the
+    allocator can ask about capabilities: build one with :meth:`wrapping`.
     """
+
+    _inner_factory: ClassVar[type[MemoryPlanSolver]]
+
+    @classmethod
+    @functools.cache
+    def wrapping(cls, inner: type[MemoryPlanSolver]) -> type["ExhaustiveSearchSolver"]:
+        """The exhaustive search over placements by ``inner``; one class per
+        ``inner``."""
+        name = f"{cls.__name__}[{inner.__name__}]"
+        namespace = {
+            "_inner_factory": inner,
+            # type() would take these from the frame creating the class,
+            # ABCMeta.__new__ in abc.py.
+            "__module__": cls.__module__,
+            "__qualname__": name,
+        }
+        return cast("type[ExhaustiveSearchSolver]", type(name, (cls,), namespace))
+
+    @classmethod
+    def supports_paired_buffers(cls) -> bool:
+        return False
+
+    @classmethod
+    def decides_lx_relayouts(cls) -> bool:
+        return False
+
+    @classmethod
+    def generates_divisions(cls) -> bool:
+        return False
+
+    @classmethod
+    def chooses_tilings(cls) -> bool:
+        return False
+
+    @classmethod
+    def tilings_from_menu(cls) -> bool:
+        return False
+
+    @classmethod
+    def replans_after_tiling(cls) -> bool:
+        return False
+
+    @classmethod
+    def linear_cost_only(cls) -> bool:
+        return False
 
     def __init__(
         self,
         buffers: Sequence[LifetimeBoundBuffer],
         size: int,
-        inner_factory: Callable[[Sequence[LifetimeBoundBuffer], int], MemoryPlanSolver],
         alignment: int = 128,
     ):
+        if not hasattr(type(self), "_inner_factory"):
+            raise TypeError(
+                "ExhaustiveSearchSolver needs an inner solver: use "
+                "ExhaustiveSearchSolver.wrapping(inner)"
+            )
         super().__init__(buffers, size, alignment)
-        self._inner_factory = inner_factory
 
     # ------------------------------------------------------------------
     # MemoryPlanSolver contract
@@ -214,8 +266,9 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
         final_solver = self._inner_factory(_make_temp_bufs(), self.limit)
         final_alloc = final_solver.plan_layout()
         addr_by_name = {a.name: a.address for a in final_alloc}
+        reason_by_name = {a.name: a.spill_reason for a in final_alloc}
         for b in buffers_list:
             b.address = addr_by_name.get(b.name)
+            b.spill_reason = reason_by_name.get(b.name)
 
-        self.spill_reasons = dict(final_solver.spill_reasons)
         return buffers_list

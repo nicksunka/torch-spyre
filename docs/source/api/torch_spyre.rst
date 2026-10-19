@@ -681,6 +681,12 @@ Environment Variables
    * - ``TORCH_SPYRE_NUM_HOST_COMPUTE_STREAMS``
      - Size of the host-compute stream pool used by program correction
        (default ``4``, maximum ``8``)
+   * - ``SPYRE_HAZARD_TRACKER``
+     - Split the program-correction triple across the ``S_prep`` and
+       ``S_dev`` streams and let flex insert the cross-stream H2D-to-compute
+       edge, overlapping the two stages. Off by default, which keeps the
+       single-stream FIFO ordering. On values match flex's grammar exactly:
+       ``1``, ``true``, ``t``, ``yes``, ``y``
    * - ``SPYRE_INDUCTOR_LOG=1``
      - *Deprecated*. Use ``TORCH_LOGS='torch_spyre.inductor'``. Enables Spyre
        Inductor logging (INFO level)
@@ -722,8 +728,9 @@ Environment Variables
    * - ``CO_OPTIMIZING_LX_PLANNING``
      - Use the co-optimizing LX allocator strategy (default ``1``)
    * - ``CPSAT_TIME_LIMIT_SECONDS``
-     - Wall-clock budget for one CP-SAT solve (default ``30``; ``0``
-       disables the limit)
+     - Wall-clock budget for one CP-SAT solve (default ``60``; ``0``
+       disables the limit). Applies separately to each optimization phase.
+       A timeout may return a feasible plan without proving optimality.
    * - ``HBM_POOL_PLANNING``
      - Enable HBM-pool planning for intermediates not in LX
        (default ``1``)
@@ -732,6 +739,13 @@ Environment Variables
        passed in as ``%pool_base_addr``, instead of the backend
        self-allocating via ``sdscbundle.device_mem_allocate``
        (default ``0``)
+   * - ``SPYRE_BACKEND_LOOP_UNROLL``
+     - Enable SDSC-bundle backend loop unrolling (default ``1``). Set ``0``
+       to preserve counted device loops; this requires autopilot. Set before
+       importing torch-spyre. Accepts case-insensitive ``1``/``true``/``yes``
+       and ``0``/``false``/``no``; invalid values raise an error. The resolved
+       boolean is part of the kernel cache key. See
+       :doc:`/compiler/working_set_reduction` for Python configuration.
    * - ``SPYRE_CORE_ID_K_FAST_EMISSION``
      - Permute physical core IDs at SDSC emission so K-collaborator cores
        sit on adjacent ring positions, reducing PSUM chain hops (default
@@ -739,10 +753,6 @@ Environment Variables
    * - ``BUNDLE_SYMBOLIC_ARGS``
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
        integers (default ``1``)
-   * - ``TORCHINDUCTOR_COMPILE_THREADS``
-     - Number of Inductor compile workers. Independent backend kernels compile in
-       parallel when this is greater than ``1``; a value of ``1`` executes
-       compilation inline
    * - ``LAYOUT_SOLVER``
      - LX scratchpad layout solver strategy: ``cpsat`` (default),
        ``greedy``, ``bestfit``, ``firstfit``, ``simulated_annealing``.
@@ -777,25 +787,17 @@ Environment Variables
      - Print the predicted-runtime report after pre-scheduling: one total
        plus a per-kernel breakdown (default ``0``).
        See :doc:`/compiler/cost_model`
-   * - ``TORCH_SPYRE_NATIVE_PACKER``
-     - Use the C++ permutation-layout packer accelerator in the
-       simulated-annealing layout solver (default ``1``; set ``0`` to force
-       the pure-Python packer). No effect unless
-       ``LAYOUT_SOLVER=simulated_annealing``.
-       See :doc:`/compiler/simulated_annealing_layout`
    * - ``MAX_BUCKETS``
      - Maximum number of work division buckets (default ``32``)
    * - ``MIN_DEFAULT_GRANULARITY``
      - Minimum default granularity for work division (default ``4``)
-   * - ``SPYRE_INDUCTOR_IGNORE_HINTS``
-     - Ignore ``spyre_hint`` annotations: ``work_div={...}``
-       work-division hints, hint-based working-set reduction, and
-       span-overflow coarse-tiling hints (default ``0``)
+   * - ``SPYRE_INDUCTOR_IGNORE_WORK_DIV_HINTS``
+     - Ignore ``spyre_hint(work_div={...})`` work-division hints and use
+       the automatic work-distribution planner (default ``0``)
    * - ``SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS``
-     - Ignore only span-overflow coarse-tiling hints; a narrower
-       alternative to ``SPYRE_INDUCTOR_IGNORE_HINTS``.  Defaults to
-       ``1`` (disabled/opt-in): set to ``0`` to enable automatic
-       span-overflow coarse tiling.
+     - Ignore the compiler-generated span-overflow coarse-tiling hints.
+       Defaults to ``1`` (disabled/opt-in): set to ``0`` to enable
+       automatic span-overflow coarse tiling.
    * - ``SPYRE_INDUCTOR_SDSC_CACHE``
      - Cache and reuse ``sdsc.json`` files during codegen when two OpSpecs
        produce identical SuperDSC content, reducing bundle size for
@@ -835,8 +837,9 @@ Environment Variables
        leaves the graph unchanged (default ``1``; set ``0`` to disable)
    * - ``SPYRE_DUMP_COST_EXPR_FILE``
      - Append one JSON record per co-optimized graph with the symbolic cost
-       objective the solver minimizes, the chosen symbol values, and each
-       term evaluated under them (default empty)
+       objective, the chosen symbol values, each term evaluated under them,
+       the terms the solver adds outside the expression, and the total it
+       minimized (default empty)
    * - ``SPYRE_DUMP_COST_FILE``
      - Destination file for the ``SPYRE_DUMP_COST`` output. Empty writes to
        stderr (default empty)
@@ -853,10 +856,20 @@ Environment Variables
      - Path to the compiler version file read to form the kernel-cache key.
        Used when ``SPYRE_KERNEL_CACHE=1``; if it is unset while caching is on,
        that kernel is compiled without caching and a warning is logged
+   * - ``TORCH_SPYRE_CACHE_SCAN``
+     - Let the FX graph and AOTAutograd caches keep graphs that use the
+       ``scan`` op, such as attention built on ``for_each_tile`` (default
+       ``1``; set ``0`` to disable). Without it, these graphs compile again in
+       every process. It uses Inductor's ``unsafe_marked_cacheable_functions``
+       (see ``_allow_scan_graph_caching``). With ``SPYRE_KERNEL_CACHE=1`` too,
+       a restart also reuses the compiled Spyre kernels for these graphs
    * - ``SPYRE_NUM_CPUS``
-     - Override the CPU count CP-SAT uses to size its search worker pool.
-       When unset the count is derived from the cgroup v2 quota, then
-       ``psutil``, then ``os.cpu_count()``
+     - CPUs CP-SAT uses to size its search worker pool (config
+       ``num_cpus``; ``config.patch(num_cpus=1)`` gives one worker). When
+       unset, or not a positive integer, ``num_cpus`` is ``None`` and the
+       count is derived from the cgroup v2 quota, then ``psutil``, then
+       ``os.cpu_count()``. Not part of the compile cache key, so a cached
+       compile is reused whatever the value
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 
@@ -873,6 +886,10 @@ Environment Variables
    * - ``FLEX_DEVICE``
      - Select the underlying flex runtime mode (``PF``, ``VF``, or
        ``MOCK``)
+   * - ``LOCAL_RANK``
+     - Per-process rank set by torchrun. Seeds the logical Spyre device
+       index when ``set_device()`` has not been called (0 when unset;
+       invalid or out-of-range values raise)
 
 **Internal:**
 
@@ -897,3 +914,7 @@ Environment Variables
      - Verbose PyTorch Inductor logging
    * - ``TORCH_COMPILE_DEBUG=1``
      - Dump Inductor debug artifacts
+   * - ``TORCHINDUCTOR_COMPILE_THREADS``
+     - Number of Inductor compile workers. Independent backend kernels
+       compile in parallel when this is greater than ``1``; a value of
+       ``1`` executes compilation inline

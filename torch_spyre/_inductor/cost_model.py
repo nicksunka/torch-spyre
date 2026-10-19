@@ -111,7 +111,11 @@ implementations, switched on ``CostParams.use_bundled_cost_model``:
   It is called with ``include_hbm=False``. Its own
   HBM-traffic term is dropped because the bundle memory term below already charges the
   operand/output bytes, and does so LX-aware; charging both double-counts memory.
-  ``predict_ops`` also charges shared-input delivery. CP-SAT uses this model.
+  ``predict_ops`` also charges shared-input delivery. CP-SAT uses this model: the
+  scratchpad allocator sets this flag, so it is the price that chooses plans. The axes
+  it is called with describe ONE pass over the output buffer; a loop that produces
+  that buffer several times is charged once per pass (``_matmul_passes``), the same
+  work count ``matmul_macs`` gives the bundled model.
 
 - BUNDLED (``use_bundled_cost_model=True``): the original device-calibrated model,
   kept alongside the above rather than deleted. Adds a compute term that OVERLAPS the
@@ -182,13 +186,17 @@ Parameters live in :class:`CostParams`, calibrated from device measurements
 import dataclasses
 import math
 from collections.abc import Mapping, Sequence
-from typing import Optional
 
+import regex
 import sympy
+from sympy.utilities.lambdify import implemented_function
 
 from .work_division import (
+    _DECODE_MAX_ROWS,
+    _decode_weight_delivery_gbps,
     _matmul_execution_cost,
     _matmul_multicast_penalty,
+    # These wrappers dispatch symbolic operands to SymPy.
     min,
     max,
     log2,
@@ -219,6 +227,20 @@ class ArgTraffic:
     # iteration). LX-resident args are ~free (excluded from read/write) unless they
     # cross the graph boundary -- see ``is_boundary``.
     loop_factor: int = 1
+    # This read's address advances with a ``for_each_tile`` loop variable at some
+    # level, by the lowering's own per-read verdict (its stamp, else a nonzero
+    # coefficient on the level's variable) -- the verdict ``loop_factor`` also uses.
+    # The variable merely appearing in the index is not enough: by that rule a read
+    # can keep it and still be pinned (the tested example is the synthetic index
+    # ``4096*FloorDiv(u0, 2)``; no lowered kernel is known to produce such a read).
+    # A coarse-tiling loop can also leave ``loop_factor`` at 1
+    # for an operand it walks, so this flag, not the factor, says which kind of loop
+    # the operand advances with. Read by ``_partitioned_operand_read_excess`` only.
+    advances_with_loop_var: bool = False
+    # Positive evidence from the existing legal candidate menu: at least one
+    # candidate splits a symbol this read indexes. This is menu-wide, not a
+    # property of the selected candidate. Missing menu evidence leaves it False.
+    has_partitioning_candidate: bool = False
     # This arg's traffic crosses the GRAPH boundary, so LX residency cannot remove it:
     # a read of a graph input, or the externally-visible write of a graph output. The
     # scratchpad planner pins such a buffer by CLONING it (allocator._push_allocation),
@@ -253,10 +275,12 @@ class ArgTraffic:
     # once, not per core (see ``broadcast``). May be a sympy expression of the
     # solver's split symbols in the co-optimizing path.
     replication: int = 1
-    # Bytes in one core's contiguous device run of this read (one DMA burst
-    # covers at most ``transport_dma_max_burst_words`` sticks of it). May be a
-    # sympy expression of the solver's split symbols; None when not provable.
+    # Bytes in one core's contiguous device run of this read. May be a
+    # symbolic expression of the solver's splits; None when not provable.
     read_run_bytes: object = None
+    # Matmul inputs only: this read's proven footprint per invocation, used by
+    # the loop-request law. None leaves the general burst estimate in charge.
+    read_tile_elems: int | None = None
 
     @property
     def is_graph_boundary(self) -> bool:
@@ -381,6 +405,14 @@ class OpFeatures:
     # None means unavailable/unsupported geometry; legacy records keep the old BW.
     transport_read_run_bytes: int | None = None
     transport_tile_elems: int | None = None
+    # True when the priced read feeds arithmetic rather than a plain copy: any
+    # one-input, one-output arithmetic op, in any graph, not only a loop body. The
+    # request law is the same; only its rate lookup differs, because an arithmetic
+    # op may run on a core count the copy calibration never visited (see
+    # ``_transport_rate_cores``). The price is nonzero only where the per-core read
+    # run is short (under about 1 KB at the peak bandwidth); longer runs cost nothing
+    # extra, so an op with large contiguous per-core runs is unchanged.
+    transport_compute_read: bool = False
     # LX RELAYOUT (PR #3439): an identity copy the scratchpad planner inserts when a
     # producer and its consumers own an LX buffer under different per-core divisions.
     # Its traffic is entirely LX, which this model charges at zero -- calibrated for
@@ -1040,26 +1072,17 @@ def _is_sym(*vals) -> bool:
     return any(isinstance(v, sympy.Basic) and not v.is_number for v in vals)
 
 
-def _tiled_rows(o) -> Optional[float]:
-    """``tile_rows_per_core``, or None (= N/A, no derate) when it is SYMBOLIC.
-
-    The co-optimizing path (``CoOptimizingAllocator._extract_op_features``) keys
-    features on the solver's undecided ``is_lx``/``output_split``, so a coarse-tiled op
-    arrives with a symbolic per-core tile height -- and every surface keyed on it
-    (``coarse_underfill_eff``, ``coarse_underfill_eff_matmul``,
-    ``_lx_spill_working_set``) is a piecewise power law that *branches* on its argument,
-    which a symbol cannot decide (issue #4233).
-
-    Dropping the derate is the cheap loss: it is bounded above by 1.0, so it orders
-    tilings against one another but never above not tiling -- it was never the term that
-    decides a tiling. Keeping it symbolic instead costs CP-SAT the whole cost objective,
-    since a branch does not linearize. The route that suits both engines -- tabulating
-    ``1/eff`` over (division index, is_lx), which also sidesteps ``mem/eff``, a quotient
-    of two decision-dependent expressions neither prices today -- is in #4233 and in
-    PR #4386, which carry the measurements behind both claims.
-    """
-    rpc = o.tile_rows_per_core
-    return None if _is_sym(rpc) else rpc
+def _select(flag, if_true, if_false):
+    """``if_true if flag else if_false`` for a flag that may be a condition over
+    the solver's symbols -- ``OpFeatures.tiles_output_dim`` under a candidate
+    tiling, which may choose to leave every output axis untiled -- as a
+    ``Piecewise`` then. Both engines lower it: CP-SAT as reified literals,
+    ``lambdify`` directly. Both arms are evaluated eagerly, so the unused one
+    must be safe to compute (e.g. ``underfill_eff`` returns 1.0 for
+    ``rows <= 0``)."""
+    if isinstance(flag, sympy.Basic) and flag not in (sympy.true, sympy.false):
+        return sympy.Piecewise((if_true, flag), (if_false, True))
+    return if_true if flag else if_false
 
 
 def coarse_underfill_eff(
@@ -1089,9 +1112,9 @@ def coarse_underfill_eff(
     ``_lx_spill_bw_derate``, which already carries a separate cap/exponent pair for matmul.
     """
     p = params or CostParams()
-    if _is_sym(rpc, cols):
-        return 1.0  # see _tiled_rows
-    if rpc <= 0 or cols <= 0:
+    if _is_sym(cols):
+        return 1.0  # a dynamic-shape width, not a solver variable: no derate
+    if rpc == 0.0 or cols <= 0:
         return 1.0
     raw = (rpc / p.coarse_underfill_rfull) ** p.coarse_underfill_exp * (
         cols / p.coarse_underfill_col_ref
@@ -1116,9 +1139,13 @@ def coarse_underfill_eff(
     # measurements exist there again.
     ceil_ = p.coarse_underfill_cap if cap is None else cap
     e0 = p.coarse_underfill_eff0
-    if raw >= e0:
-        return min(ceil_, raw)
-    return min(ceil_, e0) * (raw / e0) ** p.coarse_underfill_gamma
+    # Branch-free, so a symbolic `rpc` does not need its comparison decided:
+    # `raw >= e0` -> min(ceil_, raw); below -> min(ceil_, e0) * (raw/e0)**gamma.
+    return _select(
+        raw >= e0,
+        min(ceil_, raw),
+        _select(ceil_ >= e0, e0, ceil_) * (raw / e0) ** p.coarse_underfill_gamma,
+    )
 
 
 def coarse_underfill_eff_matmul(rpc: float, params: CostParams | None = None) -> float:
@@ -1133,15 +1160,13 @@ def coarse_underfill_eff_matmul(rpc: float, params: CostParams | None = None) ->
     one scores worse there. ``rpc<=0`` (untiled/unknown) -> 1.0.
     """
     p = params or CostParams()
-    if _is_sym(rpc):
-        return 1.0  # see _tiled_rows
-    if rpc <= 0:
+    if rpc == 0.0:
         return 1.0
     h0, ceil_ = p.coarse_underfill_h0_matmul, p.coarse_underfill_cap_matmul
     r_full, exp = p.coarse_underfill_rfull_matmul, p.coarse_underfill_exp_matmul
-    if rpc >= h0:
-        return min(ceil_, (rpc / r_full) ** exp)
-    return min(ceil_, (h0 / r_full) ** exp) * (rpc / h0) ** p.coarse_underfill_gamma
+    return min(ceil_, (max(rpc, h0) / r_full) ** exp) * min(
+        1.0, (rpc / h0) ** p.coarse_underfill_gamma
+    )
 
 
 def _lx_spill_working_set(ops: list) -> float:
@@ -1149,13 +1174,13 @@ def _lx_spill_working_set(ops: list) -> float:
     each ``tile_rows_per_core * cols`` elements. 0.0 if nothing is output-tiled."""
     ws = 0.0
     for o in ops:
-        rpc = _tiled_rows(o)
-        # `cols` can be symbolic independently of `rpc`, and `max` here is the
-        # symbolic-aware `work_division.max`, so an unguarded symbolic `cols` propagates
-        # into `ws` and only fails a frame later, at `_lx_spill_bw_derate`'s `ws <= cap`.
+        rpc = o.tile_rows_per_core
         cols = _op_cols(o)
-        if o.tiles_output_dim and rpc and not _is_sym(cols):
-            ws = max(ws, 2.0 * rpc * cols * o.dtype_bytes)
+        # A symbolic `cols` is a dynamic-shape width, not a solver variable: it
+        # must not reach the cost (see `coarse_underfill_eff`).
+        if _is_sym(cols):
+            continue
+        ws = max(ws, _select(o.tiles_output_dim, 2.0 * rpc * cols * o.dtype_bytes, 0))
     return ws
 
 
@@ -1169,9 +1194,11 @@ def _lx_spill_bw_derate(ops: list, params: CostParams | None = None) -> float:
     _cap, _exp = p.lx_spill_cap_bytes, p.lx_spill_exp
     if any(getattr(o, "is_matmul", False) for o in ops):
         _cap, _exp = p.mm_spill_ws_cap_bytes, p.mm_spill_ws_exp
-    if ws <= _cap:
+    # `max(ws, _cap)` rather than `min(1.0, (_cap / ws) ** _exp)`: the same
+    # value, but no division by zero when nothing is output-tiled (ws == 0).
+    if ws == 0:
         return 1.0
-    return (_cap / ws) ** _exp
+    return _cap**_exp / max(ws**_exp, _cap**_exp)
 
 
 def _bmm_layout_pair(o) -> tuple:
@@ -1409,19 +1436,133 @@ def _replicated_operand_reads(ops: list, p: "CostParams") -> tuple:
     return total_bytes, ns
 
 
+def _decode_delivery_price(weight_bytes, p: "CostParams"):
+    """A decode weight's delivery price as a functor of the work division: an
+    implemented function (``sympy.utilities.lambdify.implemented_function``) of the
+    op's M split, K split and core count whose ``_imp_`` is the ns to stream
+    ``weight_bytes`` at the delivery rate of that ``(m, k, cores)`` beyond their
+    time at the peak, clamped at zero and rounded to an integer.
+
+    As a Piecewise over the splits the price took ~30 s to rewrite and lower per
+    matmul; as a functor each engine evaluates it at the divisions it considers:
+    CP-SAT calls it once per candidate of the owning buffer to build one
+    ``element`` lookup (``_SympyExprToCpSat._print_AppliedUndef``), ``lambdify``
+    and ``evalf`` call it at the chosen splits. Named by its two parameters, so
+    equal functors compare (and cache) equal."""
+
+    def price(m, k, cores):
+        bw = _decode_weight_delivery_gbps(round(cores), round(m), round(k))
+        return int(round(weight_bytes * max(0.0, 1.0 / bw - 1.0 / p.bw_peak_gbps)))
+
+    # lambdify prints the name as a Python identifier.
+    tag = regex.sub(r"\W", "_", f"{weight_bytes}_{p.bw_peak_gbps!r}")
+    name = f"decode_delivery_price_{tag}"
+    return implemented_function(
+        sympy.Function(name, integer=True, nonnegative=True), price
+    )
+
+
+def _decode_weight(op) -> tuple | None:
+    """``(arg, rows)`` for a matmul's shared 2D weight reused over 2..32 rows.
+
+    That is the small-M decode projection ``work_division._decode_weight_delivery_us``
+    was measured on. The extractor's A/B byte counts exclude batch, while MACs
+    and output elements include it. Require one K*N weight slice, then check
+    K*N = (A / rows) * (out / rows), with rows = MACs / weight elements. Together
+    these exclude both per-batch weights and shared weights under B > 1.
+    Symbolic or unknown counts do not qualify."""
+    if (
+        not op.is_matmul
+        or op.dtype_bytes != 2  # the sweep measured fp16 weights only
+        or _is_sym(op.matmul_macs, op.out_elems, op.matmul_a_bytes, op.matmul_b_bytes)
+        or op.matmul_b_bytes <= 0
+    ):
+        return None
+    a_elems = op.matmul_a_bytes / max(1, op.dtype_bytes)
+    b_elems = op.matmul_b_bytes / op.dtype_bytes
+    for arg in op.args:
+        if arg.role != "input" or _is_sym(arg.elems) or arg.elems <= 0:
+            continue
+        # A per-batch [B,K,N] input has B times this footprint. Its extra batch
+        # factor otherwise cancels against the batch-inclusive MAC/output counts.
+        if abs(arg.elems - b_elems) > 0.05 * b_elems:
+            continue
+        rows = round(op.matmul_macs / arg.elems)
+        if not 1 < rows <= _DECODE_MAX_ROWS:
+            continue
+        shared_elems = (a_elems / rows) * (op.out_elems / rows)
+        if abs(shared_elems - arg.elems) <= 0.05 * arg.elems:
+            return arg, rows
+    return None
+
+
+def _decode_weight_delivery_excess(ops: list, p: "CostParams"):
+    """Extra time for a decode projection to stream its shared weight.
+
+    The base memory term charges the weight's bytes B at the shared peak. Under a
+    split, ``m`` cores splitting M share each slice and the ``n * k`` distinct
+    slices stream in parallel; the measured rate is
+    ``work_division._decode_weight_delivery_gbps(cores, m, k)``. Add B at that rate
+    minus B at the peak, clamped at zero, so the co-optimizer prices the split the
+    way the work-division planner ranks it. It replaces the cohort excess of
+    ``_shared_operand_read_excess`` for this arg. Scope as ``_decode_weight``;
+    single-pass bundles only, as for ``_partitioned_operand_read_excess``.
+
+    Under symbolic splits the price is a functor of the work division
+    (``_decode_delivery_price``), gated by residency; the engine evaluates it at
+    the op's candidate divisions. Resident weights pay nothing."""
+    if not all(_is_single_pass(op) for op in ops):
+        return 0.0
+    total = 0.0
+    external: dict[str, float | sympy.Expr] = {}
+    for op in ops:
+        found = _decode_weight(op)
+        if found is None:
+            continue
+        arg, rows = found
+        # Single-pass decode weights have loop_factor == 1. With replication
+        # removed, b == full * (1 - is_lx); the symbolic path applies this
+        # residency gate outside the division-price functor.
+        b = dataclasses.replace(arg, replication=1).hbm_elems() * op.dtype_bytes
+        full = arg.elems * arg.loop_factor * op.dtype_bytes
+        m_split, k_split, cores = op.matmul_m_split, op.reduction_cores, op.cores
+
+        def per_byte(m, k, c):
+            bw = _decode_weight_delivery_gbps(c, m, k)
+            return max(0.0, 1.0 / bw - 1.0 / p.bw_peak_gbps)
+
+        if not _is_sym(m_split, k_split, cores):
+            excess = b * per_byte(m_split, k_split, cores)
+        else:
+            is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
+            price = _decode_delivery_price(full, p)
+            excess = (1 - is_lx) * price(m_split, k_split, cores)
+        if arg.is_graph_boundary:
+            external[arg.name] = (
+                max(external[arg.name], excess) if arg.name in external else excess
+            )
+        else:
+            total += excess
+    return total + sum(external.values())
+
+
 def _shared_operand_read_excess(ops: list, p: "CostParams"):
     """Extra delivery time for a shared HBM load, beyond its one base read.
 
     Keep physical bytes unchanged and price each operand's own consumer degree.
     Resident operands vanish through hbm_elems; boundary clone loads stay separate.
+    A small-M decode weight is priced by ``_decode_weight_delivery_excess`` instead.
     """
     total = 0
     external: dict[str, float | sympy.Expr] = {}
     for op in ops:
         if not op.is_matmul:
             continue
+        decode = _decode_weight(op) if all(_is_single_pass(o) for o in ops) else None
         for arg in op.args:
             if arg.role != "input" or not arg.broadcast or arg.replication == 1:
+                continue
+            if decode is not None and arg is decode[0]:
                 continue
             excess = (
                 arg.hbm_elems()
@@ -1452,74 +1593,91 @@ def _is_single_pass(op) -> bool:
 
 
 def _partitioned_operand_read_excess(ops: list, p: "CostParams"):
-    """Extra delivery time when too few cores stream a partitioned matmul operand.
+    """Delivery time beyond bytes/peak for eligible matmul operands.
 
-    The base memory term charges an operand's bytes B at the shared peak. When a
-    matmul splits a non-replicated operand across its cores, each core streams
-    only its own slice, priced at the effective ``mm_partitioned_read_gbps_per_core``;
-    with too few cores the read takes B / (cores * rate). Add only the excess over
-    B / peak -- the same form ``_store_core_excess_ns`` uses for writes. Physical
-    bytes are unchanged, and the excess is zero once the cores reach the peak.
+    Price an unreused, partitioned operand only in an all-single-pass bundle,
+    or a once-walked ``for_each_tile`` operand with a legal partitioning choice.
+    The latter eligibility is menu-wide: replicated candidates keep this proxy
+    in addition to their existing replica/shared-load charges. Coarse loops and
+    unknown eligibility do not receive the loop-delivery estimate.
 
-    Scope follows the measurements (decode projections, 22-25 active cores):
-
-    * Every op in the bundle is single-pass by its extracted features
-      (``_is_single_pass``). Looped work (coarse-tiled attention, nested tiles)
-      has its own read pricing and shares the bundle's memory and overlap terms,
-      so a bundle with any looped op keeps its previous price whole.
-    * The operand is partitioned (``replication == 1``). A replicated operand has
-      its own per-core model (``_replicated_operand_reads``). A replication that
-      is a solver symbol gets this term exactly where it resolves to 1 -- the
-      complement of ``ArgTraffic.replicated_hbm_elems`` -- so the co-optimizer's
-      expression equals the committed-path price at every candidate.
-    * The operand is not reused: every element feeds one multiply-accumulate
-      (``matmul_macs <= elems``), i.e. a decode projection streaming its weight.
-      With row reuse the operand's delivery rate has not been measured.
-
-    Resident operands vanish through ``hbm_elems``; a graph input read by several
-    ops of the bundle is charged once, by the same ``max`` rule as
-    ``_fused_hbm_bytes``.
+    Residency removes a read; shared graph inputs are charged once. See
+    ``docs/source/compiler/cost_model.md`` for the applicability rules,
+    calibration limits, and composition with the DMA request estimate.
     """
+    return _owned_total(_partitioned_operand_terms(ops, p))
+
+
+def _partitioned_operand_terms(ops: list, p: "CostParams"):
+    """Yield ``(arg, excess)`` for every read ``_partitioned_operand_read_excess``
+    prices, before ownership aggregation (``_owned_total``). The request law on loop
+    matmul reads composes with these same per-read values."""
     rate = p.mm_partitioned_read_gbps_per_core
-    if rate <= 0 or not all(_is_single_pass(op) for op in ops):
-        return 0.0
-    total = 0.0
-    external: dict[str, float | sympy.Expr] = {}
+    if rate <= 0:
+        return
+    single_pass = all(_is_single_pass(op) for op in ops)
     for op in ops:
-        if not op.is_matmul:
+        # A symbolic trip count (a candidate tiling) leaves eligibility unknown.
+        if not op.is_matmul or _is_sym(op.loop_trip):
             continue
+        looped = op.loop_trip > 1
         for arg in op.args:
-            # A MAC count that is unknown (0) or symbolic does not prove the
-            # operand unreused, so it keeps the old price.
-            if (
-                arg.role != "input"
-                or _is_sym(op.matmul_macs, arg.elems)
-                or not 0 < op.matmul_macs <= arg.elems
-            ):
+            if arg.role != "input":
                 continue
-            if (
-                isinstance(arg.replication, sympy.Basic)
-                and arg.replication.free_symbols
-            ):
-                partitioned = sympy.Piecewise(
-                    (1, sympy.Eq(arg.replication, 1)), (0, True)
-                )
-            elif arg.replication == 1:
+            if looped:
+                # The loop walks this operand once, and its legal menu offers a
+                # partitioning choice. All candidates then use the same proxy.
+                if not (
+                    arg.advances_with_loop_var
+                    and arg.loop_factor == 1
+                    and arg.has_partitioning_candidate
+                ):
+                    continue
                 partitioned = 1
             else:
-                continue
+                # Single-pass class: whole bundle single-pass, operand unreused.
+                # A MAC count that is unknown (0) or symbolic does not prove the
+                # operand unreused, so it keeps the old price.
+                if (
+                    not single_pass
+                    or _is_sym(op.matmul_macs, arg.elems)
+                    or not 0 < op.matmul_macs <= arg.elems
+                ):
+                    continue
+                if (
+                    isinstance(arg.replication, sympy.Basic)
+                    and arg.replication.free_symbols
+                ):
+                    partitioned = sympy.Piecewise(
+                        (1, sympy.Eq(arg.replication, 1)), (0, True)
+                    )
+                elif arg.replication == 1:
+                    partitioned = 1
+                else:
+                    continue
             # The operand's own bytes on the branch where it is partitioned. The
             # 0/1 gate goes inside the Max: CP-SAT multiplies it into the small
             # reciprocal-split variables there, rather than into the Max's wide
             # integerized result, which can pass the solver's product bound.
             b = dataclasses.replace(arg, replication=1).hbm_elems() * op.dtype_bytes
             excess = max(0, partitioned * (b / (op.cores * rate) - b / p.bw_peak_gbps))
-            if arg.is_graph_boundary:
-                external[arg.name] = (
-                    max(external[arg.name], excess) if arg.name in external else excess
-                )
-            else:
-                total += excess
+            yield arg, excess
+
+
+def _owned_total(charges) -> float:
+    """Sum internal reads separately and shared graph inputs once at their maximum.
+
+    Both delivery and composed request charges use this ownership rule.
+    """
+    total = 0.0
+    external: dict[str, float | sympy.Expr] = {}
+    for arg, value in charges:
+        if arg.is_graph_boundary:
+            external[arg.name] = (
+                max(external[arg.name], value) if arg.name in external else value
+            )
+        else:
+            total += value
     return total + sum(external.values())
 
 
@@ -1566,19 +1724,26 @@ def _loop_reread_bytes(ops: list) -> float:
     """
     extra = 0.0
     for o in ops:
-        if not (getattr(o, "is_matmul", False) and o.tiles_output_dim):
+        if not getattr(o, "is_matmul", False):
             continue
         for a in o.args:
             if a.role != "input":
                 continue
             lf = getattr(a, "loop_factor", 1) or 1
-            if lf > 1:
-                # `(1 - is_lx)` rather than `a.mem != "hbm"`: same value for a concrete
-                # bool, but `mem` REJECTS a symbolic `is_lx` and this term is reached
-                # unconditionally, so the co-optimizing path lost its whole cost
-                # objective on any output-tiled matmul bundle (flash attention). Same
-                # idiom as `OpFeatures.read_bytes`, and linear in the symbol.
-                extra += a.elems * (lf - 1) * o.dtype_bytes * (1 - a.is_lx)
+            # `!= 1`, not `> 1`: under a candidate tiling `lf` may be a tile-count
+            # symbol, whose comparison cannot be decided.
+            if lf != 1:
+                # `(1 - is_lx)` rather than `a.mem != "hbm"`: same value for a
+                # concrete bool, but `mem` REJECTS a symbolic `is_lx` and this term
+                # is reached unconditionally, so the co-optimizing path lost its
+                # whole cost objective on any output-tiled matmul bundle (flash
+                # attention). Same idiom as `OpFeatures.read_bytes`, and linear in
+                # the symbol.
+                extra += _select(
+                    o.tiles_output_dim,
+                    a.elems * (lf - 1) * o.dtype_bytes * (1 - a.is_lx),
+                    0,
+                )
     return extra
 
 
@@ -1602,7 +1767,7 @@ def _loop_repeated_read_excess_ns(ops: list, p: "CostParams"):
             continue
         for arg in op.args:
             lf = getattr(arg, "loop_factor", 1) or 1
-            if arg.role != "input" or arg.broadcast or lf <= 1:
+            if arg.role != "input" or arg.broadcast:
                 continue
             is_lx = int(arg.is_lx) if isinstance(arg.is_lx, bool) else arg.is_lx
             total += arg.elems * (lf - 1) * op.dtype_bytes * (1 - is_lx) * per_byte
@@ -1804,7 +1969,17 @@ def _reduction_rows(o):
         and (_is_sym(a.is_lx) or not a.is_lx)
         and len(a.logical) >= 2
     ]
-    return max(ins, key=lambda a: a.elems).logical[-2] if ins else 0
+    # A candidate tiling makes an undecided arg's `elems` symbolic (per-tile when
+    # LX-resident); rank it by its full extent, the device-dims product it has as
+    # HBM, since sympy expressions do not order.
+    return (
+        max(
+            ins,
+            key=lambda a: math.prod(a.dims) if _is_sym(a.elems) and a.dims else a.elems,
+        ).logical[-2]
+        if ins
+        else 0
+    )
 
 
 def reduction_read_bw(rows, p):
@@ -1904,6 +2079,34 @@ def _matmul_axes_for_split_cost(o) -> tuple | None:
     )
 
 
+def _matmul_passes(o, K):
+    """How many times ``o`` runs the matmul its reconstructed axes describe.
+
+    ``_matmul_axes_for_split_cost`` describes one pass over the output buffer:
+    ``B * M * N`` is ``out_elems`` and ``K`` is the reduction extent of one trip.
+    ``matmul_macs`` is the work of the whole loop nest: the extractor scales one
+    pass, ``out_elems * K``, by the write's own loop factor. Their ratio is the
+    number of passes:
+
+    * a single-pass matmul, or a loop that walks its output buffer once (an
+      output-tiled loop, or a stacked ``[E, T, N]`` buffer whose slice ``u0`` each
+      trip writes): 1. The trips are already inside ``B * M * N``, so they are
+      not counted again;
+    * a body matmul re-writing one buffer every trip (one expert's projection,
+      one KV page of attention): the trip count;
+    * a reduction-tiled loop, which revisits the same output with each K slice:
+      the trip count;
+    * a nest: the product of what each level does.
+
+    A record without a MAC count, or with a one-pass count (written before the
+    extractor scaled it), gives 1: its previous price.
+    """
+    one_pass = o.out_elems * K
+    if o.matmul_macs == 0 or one_pass == 0:
+        return 1
+    return o.matmul_macs / one_pass
+
+
 def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
     """Compute-side (ns) of a bundle containing a matmul, using the UPSTREAM
     (``CostParams.use_bundled_cost_model=False``) matmul model.
@@ -1914,6 +2117,10 @@ def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
     version is blind to LX residency, which is what the co-optimizing planner steers).
     Standalone chooser preferences are also excluded: a preference for using more
     cores must not become an additive latency on every matmul in the graph.
+
+    The estimate is for one pass over the output buffer and is charged once per
+    pass of the loop (``_matmul_passes``), never multiplied by the trip count
+    directly: a stacked output already spans the trips.
     """
     total_us = 0.0
     for o in ops:
@@ -1943,7 +2150,7 @@ def _matmul_ns_upstream(ops: list, p: CostParams) -> float:
                 f"(b_axis={b_axis}, m_axis={m_axis}, n_axis={n_axis}, "
                 f"k_axis={k_axis}, cores_used={cores_used})"
             )
-        total_us += us
+        total_us += us * _matmul_passes(o, k_axis[0])
     return total_us * 1000.0 + _matmul_batch_split_ns(ops, p)  # us -> ns
 
 
@@ -1976,7 +2183,7 @@ def _matmul_batch_split_ns(ops: list, p: CostParams):
         m_max = max(1, int(m_extent) // max(1, p.mm_batch_split_min_m_rows))
         if m_max <= 1:
             continue
-        trip = max(1, int(getattr(o, "loop_trip", 1) or 1))
+        trip = max(1, getattr(o, "loop_trip", 1) or 1)
 
         def log2(value):
             if isinstance(value, sympy.Basic) and value.free_symbols:
@@ -2002,17 +2209,15 @@ def _matmul_ns_bundled(ops: list, p: CostParams) -> float:
             # A coarse-tiled matmul appears to underfill the array MORE per tile than a
             # standalone one, but the current data is too weak to fit -- so tiled
             # matmuls take pt_eff=1; standalone matmuls use the array-fill derate.
-            if o.tiles_output_dim:
-                pt_eff = 1.0
-            else:
-                pt_eff = underfill_eff(
-                    o.matmul_rows_per_core, p, p.underfill_target_passes_matmul
-                )
+            pt_eff = underfill_eff(
+                o.matmul_rows_per_core, p, p.underfill_target_passes_matmul
+            )
             # A DEFAULT-LAYOUT bmm (both operands on the slow [0,1,2] tile order,
             # B>=gate) runs the array at the slow rate; every other matmul keeps the
             # plain peak.
             mac_peak = _matmul_mac_peak(o, p)
-            compute += o.matmul_macs / o.cores / (mac_peak * pt_eff)
+            per_peak = o.matmul_macs / o.cores / mac_peak
+            compute += _select(o.tiles_output_dim, per_peak, per_peak / pt_eff)
     # SPLIT-SHAPE re-read: a large per-core output tile that is ALSO split many ways
     # re-reads operands beyond what the symmetric area spill counts. Two-sided:
     # splitting the LONGER output dim (knee 8) is penalized sooner/harder than the
@@ -2061,6 +2266,12 @@ def _lazy_min(r, w):
     return min(r, w)
 
 
+def _peak_mem_ns(r, w, p: CostParams):
+    """HBM time for ``r`` read and ``w`` written bytes at the peak rate, plus
+    the read/write turnaround."""
+    return (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(r, w)
+
+
 def _store_core_excess_ns(ops: list, p: "CostParams"):
     """Extra write time when the writing cores cannot saturate the shared bus.
 
@@ -2082,6 +2293,53 @@ def _store_core_excess_ns(ops: list, p: "CostParams"):
     return total
 
 
+def _transport_rate_cores(rates: dict, cores: int, compute_read: bool):
+    """Calibrated core count whose ns/request applies to ``cores``, else None.
+
+    A copy is priced only at a calibrated count. A read that feeds arithmetic
+    may run on any count; its requests sustain the rate of the largest
+    calibrated count not above it (22 cores stream like 16, 11 like 8), so
+    splitting the stick axis is never free just because the count is odd.
+
+    The extension to uncalibrated counts is an assumption, not a measurement: the
+    calibration visited only the counts in ``rates``, and the rate of a count between
+    two of them is taken to be the lower one's. It may over- or under-state a real
+    stream at such a count; a measurement at those counts would replace it.
+    """
+    if cores in rates:
+        return cores
+    if not compute_read:
+        return None
+    below = [c for c in rates if c <= cores]
+    return max(below) if below else None
+
+
+def _dma_request_law_available(
+    p: "CostParams", dtype_bytes, run_bytes, tile_elems, cores, compute_read
+) -> bool:
+    """Whether the request law is calibrated for one read of this geometry: fp16,
+    a proven run and footprint, and a calibrated rate at a concrete core count.
+    Shared by every read the law prices, so all of them decline the same way."""
+    rates = p.transport_dma_ns_per_request
+    if (
+        not rates
+        or p.transport_dma_word_bytes <= 0
+        or p.transport_dma_max_burst_words <= 0
+        or dtype_bytes != 2
+        or run_bytes is None
+        or tile_elems is None
+        or tile_elems <= 0
+        or sympy.sympify(run_bytes).is_positive is False
+    ):
+        return False
+    cores = sympy.sympify(cores)
+    if not cores.free_symbols:
+        key = _transport_rate_cores(rates, cores, compute_read)
+        if key is None or rates[key] <= 0:
+            return False
+    return True
+
+
 def transport_dma_cost_available(op: OpFeatures, p: "CostParams") -> bool:
     """Whether transport geometry and calibration support this cost term.
 
@@ -2089,27 +2347,103 @@ def transport_dma_cost_available(op: OpFeatures, p: "CostParams") -> bool:
     zero cost must not be confused with unavailable pricing. Symbolic core
     counts are priced piecewise; callers expanding a candidate menu must also
     check each concrete candidate against the calibrated core counts.
+
+    One-input, one-output ops only. A matmul's operand reads are priced by the
+    same law in ``_loop_operand_request_excess``, never here: the transport fields
+    stay None for matmuls, so this answer and the direct-read decisions that
+    depend on it are unchanged by that term.
     """
-    rates = p.transport_dma_ns_per_request
-    if (
-        not rates
-        or p.restickify_core_gbps <= 0
-        or p.transport_dma_word_bytes <= 0
-        or p.transport_dma_max_burst_words <= 0
-        or op.dtype_bytes != 2
-        or op.transport_read_run_bytes is None
-        or op.transport_tile_elems is None
-        or op.transport_tile_elems <= 0
-        or sympy.sympify(op.transport_read_run_bytes).is_positive is False
+    if p.restickify_core_gbps <= 0 or not _dma_request_law_available(
+        p,
+        op.dtype_bytes,
+        op.transport_read_run_bytes,
+        op.transport_tile_elems,
+        op.cores,
+        op.transport_compute_read,
     ):
-        return False
-    cores = sympy.sympify(op.cores)
-    if not cores.free_symbols and rates.get(cores, 0) <= 0:
         return False
     return (
         sum(a.role == "input" for a in op.args) == 1
         and sum(a.role == "output" for a in op.args) == 1
     )
+
+
+def _dma_request_excess_ns(
+    payload,
+    run_bytes,
+    cores,
+    compute_read,
+    p: "CostParams",
+    *,
+    byte_time,
+    with_transpose=False,
+):
+    """One invocation's DMA request time beyond ``byte_time`` (the request law).
+
+    ``payload`` bytes are read in runs of ``run_bytes`` (a run ends at the innermost
+    split, so it may be a Piecewise of splits); each run is one request, floored at
+    one maximum burst and capped at one word. Requests issue at the calibrated
+    ns/request of ``cores`` (a compute read takes the largest calibrated count at or
+    below its own, ``_transport_rate_cores``). ``with_transpose`` adds the stick-axis
+    swap's per-core ceiling. Shared by every caller; there is one copy of the law.
+    """
+    rates = p.transport_dma_ns_per_request
+    # Fold the payload INTO each branch before Min/Max integerization. A
+    # requests/byte intermediate would round sub-unit densities to zero in
+    # CP-SAT, silently erasing the split preference. No decision-dependent
+    # denominator remains: each run branch becomes payload*split/extent.
+    raw_requests = sympy.piecewise_fold(payload / sympy.sympify(run_bytes))
+    min_requests = math.ceil(
+        payload / (p.transport_dma_word_bytes * p.transport_dma_max_burst_words)
+    )
+    max_requests = math.ceil(payload / p.transport_dma_word_bytes)
+
+    def at_most(requests, limit):
+        # Each affine run branch is a static coefficient times one split.
+        # Tighten the comparison to an integer split bound before CP-SAT.
+        coefficient, split = requests.as_coeff_Mul()
+        if split.is_Symbol and coefficient > 0:
+            return sympy.Le(split, sympy.floor(limit / coefficient))
+        return sympy.Le(requests, limit)
+
+    def for_run(requests):
+        branches = []
+        # A compute read takes the rate of the largest calibrated count at or
+        # below its own; test the counts from the top so the first hit wins.
+        for count, ns in sorted(rates.items(), reverse=compute_read):
+            if ns <= 0:
+                continue
+            floor = max(
+                0,
+                payload / (count * p.restickify_core_gbps) - 2 * byte_time
+                if with_transpose
+                else 0,
+                min_requests * ns - byte_time,
+            )
+            cap = max(floor, max_requests * ns - byte_time)
+            if floor == cap:
+                value = floor
+            else:
+                threshold = math.floor((floor + byte_time) / ns)
+                value = sympy.Piecewise(
+                    (floor, at_most(requests, threshold)),
+                    (requests * ns - byte_time, at_most(requests, max_requests)),
+                    (cap, True),
+                )
+            at_count = (
+                sympy.Ge(cores, count) if compute_read else sympy.Eq(cores, count)
+            )
+            branches.append((value, at_count))
+        return sympy.Piecewise(*branches, (0, True))
+
+    # Price each physical run branch separately. This avoids a reciprocal
+    # of a decision, conditional comparisons of conditional expressions, and
+    # nested fixed-point time Max nodes. Values remain in ns throughout.
+    if isinstance(raw_requests, sympy.Piecewise):
+        return sympy.Piecewise(
+            *((for_run(value), condition) for value, condition in raw_requests.args)
+        )
+    return for_run(raw_requests)
 
 
 def _transport_dma_excess_ns(ops: list, p: "CostParams"):
@@ -2124,7 +2458,6 @@ def _transport_dma_excess_ns(ops: list, p: "CostParams"):
     A plain copy or an HBM->LX stage pays only the source-request excess, not
     the transpose ceiling. Fully local inputs never issue off-chip requests.
     """
-    rates = p.transport_dma_ns_per_request
     total = 0.0
     for op in ops:
         if not transport_dma_cost_available(op, p):
@@ -2132,65 +2465,19 @@ def _transport_dma_excess_ns(ops: list, p: "CostParams"):
         inputs = [a for a in op.args if a.role == "input"]
         outputs = [a for a in op.args if a.role == "output"]
         payload = op.transport_tile_elems * op.dtype_bytes
-        # Fold the payload INTO each branch before Min/Max integerization. A
-        # requests/byte intermediate would round sub-unit densities to zero in
-        # CP-SAT, silently erasing the split preference. No decision-dependent
-        # denominator remains: each run branch becomes payload*split/extent.
-        raw_requests = sympy.piecewise_fold(
-            payload / sympy.sympify(op.transport_read_run_bytes)
-        )
-        min_requests = math.ceil(
-            payload / (p.transport_dma_word_bytes * p.transport_dma_max_burst_words)
-        )
-        max_requests = math.ceil(payload / p.transport_dma_word_bytes)
         is_swap = op.hbm_pattern == "restickify"
         byte_time = payload / (p.bw_restickify_gbps if is_swap else p.bw_peak_gbps)
 
-        def at_most(requests, limit):
-            # Each affine run branch is a static coefficient times one split.
-            # Tighten the comparison to an integer split bound before CP-SAT.
-            coefficient, split = requests.as_coeff_Mul()
-            if split.is_Symbol and coefficient > 0:
-                return sympy.Le(split, sympy.floor(limit / coefficient))
-            return sympy.Le(requests, limit)
-
-        def for_run(requests, with_transpose):
-            branches = []
-            for cores, ns in rates.items():
-                if ns <= 0:
-                    continue
-                floor = max(
-                    0,
-                    payload / (cores * p.restickify_core_gbps) - 2 * byte_time
-                    if with_transpose
-                    else 0,
-                    min_requests * ns - byte_time,
-                )
-                cap = max(floor, max_requests * ns - byte_time)
-                if floor == cap:
-                    value = floor
-                else:
-                    threshold = math.floor((floor + byte_time) / ns)
-                    value = sympy.Piecewise(
-                        (floor, at_most(requests, threshold)),
-                        (requests * ns - byte_time, at_most(requests, max_requests)),
-                        (cap, True),
-                    )
-                branches.append((value, sympy.Eq(op.cores, cores)))
-            return sympy.Piecewise(*branches, (0, True))
-
-        # Price each physical run branch separately. This avoids a reciprocal
-        # of a decision, conditional comparisons of conditional expressions, and
-        # nested fixed-point time Max nodes. Values remain in ns throughout.
         def for_geometry(with_transpose):
-            if isinstance(raw_requests, sympy.Piecewise):
-                return sympy.Piecewise(
-                    *(
-                        (for_run(value, with_transpose), condition)
-                        for value, condition in raw_requests.args
-                    )
-                )
-            return for_run(raw_requests, with_transpose)
+            return _dma_request_excess_ns(
+                payload,
+                op.transport_read_run_bytes,
+                op.cores,
+                op.transport_compute_read,
+                p,
+                byte_time=byte_time,
+                with_transpose=with_transpose,
+            )
 
         read_excess = for_geometry(False)
         if is_swap:
@@ -2208,6 +2495,98 @@ def _transport_dma_excess_ns(ops: list, p: "CostParams"):
     return total
 
 
+def operand_request_cost_available(
+    op: OpFeatures, arg: ArgTraffic, p: "CostParams"
+) -> bool:
+    """Whether the request law prices this matmul input: an input of a LOOPED
+    matmul (``loop_trip > 1``) whose read geometry the extractor proved, at a
+    calibration the law covers. A single-pass matmul is never priced here, so this
+    term is disjoint from any single-pass delivery estimate. Unknown geometry
+    declines (the read keeps its previous price); it is never priced as zero, nor
+    is a symbolic trip count (a candidate tiling) taken as looped."""
+    return (
+        op.is_matmul
+        and not _is_sym(op.loop_trip)
+        and op.loop_trip > 1
+        and arg.role == "input"
+        and _dma_request_law_available(
+            p,
+            op.dtype_bytes,
+            arg.read_run_bytes,
+            arg.read_tile_elems,
+            op.cores,
+            True,
+        )
+    )
+
+
+def _loop_operand_request_excess(ops: list, p: "CostParams"):
+    """DMA request time of looped matmul operand reads, beyond what the loop-delivery
+    estimate already charges for the same reads.
+
+    A matmul operand read from HBM is a compute read, priced by the existing request
+    law (``_dma_request_excess_ns``) exactly as any other: requests = per-trip
+    footprint / per-core contiguous run, at the calibrated rate of the largest
+    calibrated count at or below the op's cores, floored and capped by the law's
+    burst bounds, times the loop trips, times ``(1 - is_lx)``. Each HBM input is
+    priced on its own. The excess is nonzero only where a core's run is short
+    (under ``ns * bw_peak`` bytes: about 1.1 KB at 4-16 cores, 0.56 KB at 32), as when
+    a column split leaves each core one stick per row of an expert bank.
+
+    The loop-delivery estimate (``_partitioned_operand_read_excess``, E_part) and the
+    request law (E_req) both charge the time to move the same bytes beyond the same
+    ``bytes / peak`` base. The delivery takes as long as the slower of the two, so a
+    read's composed excess is ``max(E_part, E_req)``, never their sum. Reads are
+    aggregated by ownership with ``_owned_total``, the same function that builds
+    E_part's total: a graph input read by several ops of the bundle is one load,
+    charged once at the maximum of its uses' composed excesses. This returns only
+    the part E_part does not already charge, ``owned(max(E_part, E_req)) -
+    owned(E_part)``, which is never negative.
+
+    Scope: looped matmuls only (``operand_request_cost_available``). Where the
+    report extracts without the legal menu, E_part is omitted and this is E_req.
+    Uses only existing calibrated parameters; adds no constant.
+    """
+    # _partitioned_operand_terms yields the original ArgTraffic objects, retained
+    # by ops. Both passes therefore use the same live identities within this call.
+    part = {id(arg): excess for arg, excess in _partitioned_operand_terms(ops, p)}
+    requests = {}
+    for op in ops:
+        for arg in op.args:
+            if not operand_request_cost_available(op, arg, p):
+                continue
+            payload = arg.read_tile_elems * op.dtype_bytes
+            excess = _dma_request_excess_ns(
+                payload,
+                arg.read_run_bytes,
+                op.cores,
+                True,
+                p,
+                byte_time=payload / p.bw_peak_gbps,
+            )
+            requests[id(arg)] = (1 - arg.is_lx) * op.loop_trip * excess
+    if not requests:
+        return 0.0
+    return _composed_delivery_excess(
+        [
+            (arg, part.get(id(arg), 0), requests.get(id(arg), 0))
+            for op in ops
+            for arg in op.args
+            if id(arg) in part or id(arg) in requests
+        ]
+    )
+
+
+def _composed_delivery_excess(reads) -> float:
+    """Add ``owned(max(delivery, requests)) - owned(delivery)``.
+
+    Aggregate each side before subtracting so a shared input has one owner.
+    The cost-model documentation gives a two-reader worked example.
+    """
+    composed = _owned_total((arg, max(part, request)) for arg, part, request in reads)
+    return composed - _owned_total((arg, part) for arg, part, _ in reads)
+
+
 def _read_burst_excess_ns(ops: list, p: "CostParams"):
     """DMA request time of short-burst HBM reads beyond their byte charge.
 
@@ -2218,7 +2597,9 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
     term's calibrated aggregate ``transport_dma_ns_per_request``, and charges
     only the time by which requests exceed the byte charge. Transport ops keep
     ``_transport_dma_excess_ns``; replicated per-core loads keep
-    ``_replicated_operand_reads``; a run that cannot be proven adds nothing.
+    ``_replicated_operand_reads``. Proven looped-matmul geometry uses
+    ``_loop_operand_request_excess`` instead, which composes requests with
+    delivery and counts shared inputs once. An unproven run adds nothing.
     """
     rates = p.transport_dma_ns_per_request
     if (
@@ -2232,6 +2613,10 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
         if transport_dma_cost_available(op, p):
             continue
         for arg in op.args:
+            # The loop-request path already composes this read's request cost
+            # with its delivery estimate and de-duplicates shared inputs.
+            if operand_request_cost_available(op, arg, p):
+                continue
             run = getattr(arg, "read_run_bytes", None)
             if arg.role != "input" or run is None:
                 continue
@@ -2239,6 +2624,11 @@ def _read_burst_excess_ns(ops: list, p: "CostParams"):
             if not arg.broadcast and replication.is_number and replication != 1:
                 continue
             payload = arg.elems * op.dtype_bytes
+            # Charged only while the arg is in HBM (the `1 - is_lx` below), where
+            # a candidate-tiled arg keeps its full extent: drop the per-tile LX
+            # size (`dump_cost_model._per_tile_elems`) so the count is concrete.
+            if _is_sym(arg.is_lx):
+                payload = sympy.sympify(payload).subs(arg.is_lx, 0)
             if payload <= 0:
                 continue
             requests = sympy.piecewise_fold(payload / sympy.sympify(run))
@@ -2361,14 +2751,11 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
             if bw:
                 mem += (ro + wo) / bw
             else:
-                mem += (
-                    ro + wo
-                ) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(ro, wo)
+                mem += _peak_mem_ns(ro, wo, p)
     elif (
         len(ops) == 1
         and ops[0].is_reduction
         and not getattr(ops[0], "is_matmul", False)
-        and not ops[0].tiles_output_dim
     ):
         # A STANDALONE row-reduction (sum/amax/mean/read over the last axis, or sumall)
         # reads at a rate that FALLS with ROWS. The rate is fit as (R+W)/time, so it
@@ -2382,7 +2769,12 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         _bw = reduction_read_bw(
             _reduction_rows(ops[0]), p
         ) * _reduction_bw_cores_factor(ops[0].cores, p)
-        mem = (r + w) / _bw
+        # A candidate tiling that tiles an output axis takes the default rate below.
+        mem = _select(
+            ops[0].tiles_output_dim,
+            _peak_mem_ns(r, w, p),
+            (r + w) / _bw,
+        )
     elif (
         len(ops) > 1
         and any(o.is_reduction for o in ops)
@@ -2407,9 +2799,9 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         # cores ladder with repeats -- the present cells are one shape, one log, n=1 per
         # config. The throughput term is added to `compute` below, after `mem` receives
         # the underfill/spill derates, so those memory effects do not inflate it.
-        mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(r, w)
+        mem = _peak_mem_ns(r, w, p)
     else:
-        mem = (r + w) / p.bw_peak_gbps + p.rw_turnaround_ns_per_byte * _lazy_min(r, w)
+        mem = _peak_mem_ns(r, w, p)
     # Replace the stores' peak-rate charge with the writing cores' limited rate.
     mem = mem + _store_core_excess_ns(ops, p)
     # Sharing slows delivery of these same reads; it does not add HBM bytes.
@@ -2422,6 +2814,7 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         + rep_ns
         + _shared_operand_read_excess(ops, p)
         + _partitioned_operand_read_excess(ops, p)
+        + _decode_weight_delivery_excess(ops, p)
     )
     # NOTE: a multi-op dependent chain (e.g. add3/add4 = chained binary adds) runs
     # slower than its byte count because the intermediate is written then read back
@@ -2447,9 +2840,14 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
     # used only by the bundled explain path.)
     eff = 1.0
     for o in ops:
-        rpc = _tiled_rows(o)
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc:
-            eff = min(eff, coarse_underfill_eff(rpc, _op_cols(o), p))
+        eff = min(
+            eff,
+            _select(
+                o.tiles_output_dim,
+                coarse_underfill_eff(o.tile_rows_per_core, _op_cols(o), p),
+                1.0,
+            ),
+        )
     # LX-SPILL bandwidth derate: a coarse-tiled kernel whose per-core working set (~2
     # live intermediate tiles) overflows LX spills to HBM, and that spilled traffic runs
     # slower than the modeled rate. Bytes are already counted as HBM; here we derate the
@@ -2522,6 +2920,11 @@ def predict_ops(ops: list, params: CostParams | None = None) -> float:
         + _loop_repeated_read_excess_ns(ops, p)
         + _read_burst_excess_ns(ops, p)
     )
+    # Looped matmul operand reads: the request law's part beyond the loop-delivery
+    # estimate, serialized like the transport term above (the same law).
+    operand_requests_ns = _loop_operand_request_excess(ops, p)
+    if not (isinstance(operand_requests_ns, float) and operand_requests_ns == 0):
+        t = t + operand_requests_ns
     # (A genuine-reduction cross-core ring-combine term once lived here; it is provably
     # bounded by ~cores * a tiny per-elem cost <= ~5 ns -- below run-to-run noise --
     # so it is dropped as inert. K is never split for matmul, so there is no matmul
@@ -2550,8 +2953,8 @@ def _explain_matmul_bundled(lines: list, ops: list, p: CostParams) -> str:
     # Underfill derate (output-dim tiling): smallest per-core tile governs.
     eff, eff_rows = 1.0, None
     for o in ops:
-        rpc = _tiled_rows(o)
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc:
+        rpc = o.tile_rows_per_core
+        if o.tiles_output_dim:
             e = coarse_underfill_eff_matmul(rpc, p)
             if e < eff:
                 eff, eff_rows = e, rpc
@@ -2804,6 +3207,12 @@ def explain(ops: list, params: CostParams | None = None) -> str:
             f"({p.mm_partitioned_read_gbps_per_core:g} GB/s per reading core; "
             "before compute overlap)"
         )
+    decode_extra = _decode_weight_delivery_excess(ops, p)
+    if decode_extra:
+        lines.append(
+            f"     decode weight delivery: +{decode_extra / 1000:.2f} us "
+            "(shared-weight split rate, before compute overlap)"
+        )
     batch_split_extra = (
         0.0 if p.use_bundled_cost_model else _matmul_batch_split_ns(ops, p)
     )
@@ -2829,6 +3238,12 @@ def explain(ops: list, params: CostParams | None = None) -> str:
         lines.append(
             f"     transport DMA/transpose excess: +{restickify_extra / 1000:.2f} us "
             "(after bandwidth adjustments and compute overlap)"
+        )
+    operand_requests = _loop_operand_request_excess(ops, p)
+    if operand_requests:
+        lines.append(
+            f"     loop operand DMA requests: +{operand_requests / 1000:.2f} us "
+            "(beyond the partitioned-read limit; after compute overlap)"
         )
     if any(getattr(o, "is_matmul", False) for o in ops) and p.use_bundled_cost_model:
         return _explain_matmul_bundled(lines, ops, p)
@@ -2867,12 +3282,14 @@ def explain(ops: list, params: CostParams | None = None) -> str:
                     f"(B={B}/{b}, M={M}/{m}, N={N}/{n}, K={K}/{k}, "
                     f"cores_used={cores_used})"
                 )
+            passes = _matmul_passes(o, K)
+            per_pass = "" if passes == 1 else f" per pass x {float(passes):g} passes"
             lines.append(
                 f"     {o.name}: B={B}(/{b}) M={M:.0f}(/{m}) N={N:.0f}(/{n}) "
                 f"K={K:.0f}(/{k}) shared_weight={shared_weight} "
-                f"cores={cores_used} -> compute {us:.2f} us"
+                f"cores={cores_used} -> compute {us:.2f} us{per_pass}"
             )
-            compute_ns += us * 1000.0
+            compute_ns += us * passes * 1000.0
         R, W = _fused_hbm_bytes(ops)  # external input counted once (fused kernel)
         lines.append(
             f"     compute = {compute_ns / 1000:.2f} us   R={R}B (read) W={W}B (write)"
@@ -2888,8 +3305,8 @@ def explain(ops: list, params: CostParams | None = None) -> str:
     # Underfill derate (output-dim tiling): smallest per-core tile governs.
     eff, eff_rows, eff_cols = 1.0, None, 0.0
     for o in ops:
-        rpc = _tiled_rows(o)
-        if o.loop_trip > 1 and o.tiles_output_dim and rpc:
+        rpc = o.tile_rows_per_core
+        if o.tiles_output_dim:
             e = coarse_underfill_eff(rpc, _op_cols(o), p)
             if e < eff:
                 eff, eff_rows, eff_cols = e, rpc, _op_cols(o)

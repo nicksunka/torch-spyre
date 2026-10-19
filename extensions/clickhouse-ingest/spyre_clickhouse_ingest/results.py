@@ -36,7 +36,7 @@ import json
 import os
 import platform as _platform
 import sys
-
+import tempfile
 import uuid
 import xml.etree.ElementTree as etree
 from collections import Counter, defaultdict
@@ -47,6 +47,7 @@ from pathlib import Path
 # Aliased to `schema_model` so the call sites below read unchanged.
 from spyre_clickhouse_ingest import schema as schema_model
 from spyre_clickhouse_ingest import (
+    error_case_names,
     extract_properties,
     get_client,
     insert_artifact_result,
@@ -64,10 +65,14 @@ from spyre_clickhouse_ingest import (
     tables_present,
 )
 from spyre_clickhouse_ingest.junit import _runner_run_id, _threaded_run_id
+from spyre_clickhouse_ingest.offline import add_offline_options
+from spyre_clickhouse_ingest.offline import main as offline_main
 from spyre_clickhouse_ingest.options import (
+    pair,
     add_artifact_options,
     artifact_options,
     artifact_spec,
+    ci_tags,
 )
 from spyre_clickhouse_ingest.registry import MISC, tag_families
 from spyre_clickhouse_ingest.resolver import (
@@ -76,6 +81,7 @@ from spyre_clickhouse_ingest.resolver import (
     misc_warning,
     named,
 )
+from spyre_clickhouse_ingest.writer import DryRunClient
 import regex as re
 
 # ---------------------------------------------------------------------------
@@ -666,11 +672,174 @@ def _bench_entries(records: list) -> list:
 
 
 # quality / regression_eligible come from a spyre-dashboard migration.
-# Omit rather than ALTER ADD when they have not been applied.
-_BENCHMARK_RUN_OPTIONAL_COLUMNS = ("run_type", "quality", "regression_eligible")
+# Soft-omit rather than ALTER ADD when they have not been applied (forward runs).
+_BENCHMARK_RUN_OPTIONAL_COLUMNS = (
+    "run_type",
+    "quality",
+    "regression_eligible",
+)
+
+# Backfill scalars for Spyre View Run Evidence. When a run carries these, they
+# are REQUIRED — soft-omitting then inserting would source_file-dedup a later
+# retry and permanently lose the metadata. Check before insert; fail until present.
+_BENCHMARK_RUN_BACKFILL_COLUMNS = (
+    "is_backfill",
+    "historical_measurement_timestamp",
+    "replay_timestamp",
+)
+
+
+class BackfillSchemaIncomplete(RuntimeError):
+    """benchmark_runs is missing columns required for a deliberate backfill insert."""
+
+
+def parse_historical_measurement(value: str) -> datetime:
+    """Parse YYYY-MM-DD as UTC midnight. Rejects unpadded dates (e.g. 2026-9-6)."""
+    raw = (value or "").strip()
+    if len(raw) != 10 or raw[4] != "-" or raw[7] != "-":
+        raise ValueError(f"historical measurement must be YYYY-MM-DD, got {value!r}")
+    y, m, d = raw.split("-")
+    if not (y.isdigit() and m.isdigit() and d.isdigit()):
+        raise ValueError(f"historical measurement must be YYYY-MM-DD, got {value!r}")
+    if len(y) != 4 or len(m) != 2 or len(d) != 2:
+        raise ValueError(f"historical measurement must be YYYY-MM-DD, got {value!r}")
+    try:
+        return datetime(int(y), int(m), int(d), tzinfo=UTC)
+    except ValueError as e:
+        raise ValueError(
+            f"historical measurement must be YYYY-MM-DD, got {value!r}"
+        ) from e
+
+
+def parse_replay_timestamp(value: str) -> datetime:
+    """Parse an ISO-8601 / ClickHouse-friendly timestamp to aware UTC datetime.
+
+    Rejects date-only values (e.g. ``2026-10-07``): fromisoformat would accept
+    them as midnight, which is not a real replay wall-clock. Require a time
+    component (``T`` or a space before HH:MM).
+    """
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError(f"replay timestamp must be non-empty ISO-8601, got {value!r}")
+    # Date-only YYYY-MM-DD — fromisoformat accepts it as 00:00:00; refuse.
+    if "T" not in raw and " " not in raw:
+        raise ValueError(
+            f"replay timestamp must include a time component (not date-only), got {value!r}"
+        )
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as e:
+        raise ValueError(f"replay timestamp must be ISO-8601, got {value!r}") from e
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def _require_nonblank_cli(name: str, value) -> str | None:
+    """None = option omitted; non-None must strip to a non-empty value or raise.
+
+    Distinguishes omitted (forward nightly) from ``--flag ' '`` / ``--flag ''``,
+    which must fail before connect so source_file dedup cannot lock out a retry.
+    """
+    if value is None:
+        return None
+    stripped = str(value).strip()
+    if not stripped:
+        raise ValueError(
+            f"{name} was supplied blank (whitespace/empty); "
+            f"omit the flag for a forward run, or pass a real value"
+        )
+    return stripped
+
+
+def build_backfill_meta(
+    *,
+    is_backfill: bool = False,
+    historical_measurement=None,
+    replay_timestamp=None,
+) -> dict:
+    """Parse CLI backfill args once. Empty dict = forward nightly (no scalars).
+
+    ``None`` means the option was omitted. A supplied blank (``''`` / ``' '``)
+    raises ValueError before any ClickHouse connect or XML write. Does not touch
+    created_at — historical day lives only in historical_measurement_timestamp.
+    """
+    hist = _require_nonblank_cli("--historical-measurement", historical_measurement)
+    replay = _require_nonblank_cli("--replay-timestamp", replay_timestamp)
+    if not is_backfill and hist is None and replay is None:
+        return {}
+    meta: dict = {}
+    if is_backfill or hist is not None or replay is not None:
+        # Timestamps without the flag still mark the row; drawer needs the bit.
+        meta["is_backfill"] = 1
+    if is_backfill and hist is None:
+        print(
+            "  [warn] --is-backfill without --historical-measurement — "
+            "drawer Historical measurement will be empty",
+            file=sys.stderr,
+        )
+    if hist is not None:
+        meta["historical_measurement_timestamp"] = parse_historical_measurement(hist)
+    if replay is not None:
+        meta["replay_timestamp"] = parse_replay_timestamp(replay)
+    return meta
+
+
+def apply_backfill_meta(run_meta: dict, meta: dict) -> None:
+    """Merge pre-parsed backfill scalars onto a benchmark/kernel run_meta."""
+    if meta:
+        run_meta.update(meta)
+
+
+def apply_backfill_args(
+    run_meta: dict,
+    *,
+    is_backfill: bool = False,
+    historical_measurement=None,
+    replay_timestamp=None,
+) -> None:
+    """Parse + attach backfill scalars (test helper; main uses build_backfill_meta)."""
+    apply_backfill_meta(
+        run_meta,
+        build_backfill_meta(
+            is_backfill=is_backfill,
+            historical_measurement=historical_measurement,
+            replay_timestamp=replay_timestamp,
+        ),
+    )
+
+
+def _naive_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is not None:
+        return dt.astimezone(UTC).replace(tzinfo=None)
+    return dt
+
+
+def _run_meta_wants_backfill(run_meta: dict) -> bool:
+    return any(k in run_meta for k in _BENCHMARK_RUN_BACKFILL_COLUMNS)
+
+
+def require_backfill_columns(client, run_meta: dict) -> None:
+    """Raise BackfillSchemaIncomplete if run_meta needs columns the table lacks.
+
+    Must run before insert so a missing-migration attempt does not write a row
+    that source_file-dedup would block on retry after the schema migration.
+    """
+    if not _run_meta_wants_backfill(run_meta):
+        return
+    absent = _absent_columns(client, "benchmark_runs", _BENCHMARK_RUN_BACKFILL_COLUMNS)
+    if absent:
+        raise BackfillSchemaIncomplete(
+            "benchmark_runs missing backfill columns "
+            f"{', '.join(sorted(absent))} — apply the dashboard migration "
+            "before retrying; not inserting so source_file stays free"
+        )
 
 
 def insert_benchmark_run(client, run_id: int, run_meta: dict) -> None:
+    # Refuse to soft-drop backfill scalars: that would lock out a corrected retry.
+    require_backfill_columns(client, run_meta)
+
     quality, eligible = classify_run_quality(run_meta.get("version_info"))
     values = {
         "run_id": run_id,
@@ -685,6 +854,16 @@ def insert_benchmark_run(client, run_id: int, run_meta: dict) -> None:
         "quality": quality,
         "regression_eligible": eligible,
     }
+    # Backfill scalars only when the caller set them — forward nightly omit so
+    # CH defaults (0 / NULL) keep the drawer Unavailable.
+    if "is_backfill" in run_meta:
+        values["is_backfill"] = int(run_meta["is_backfill"])
+    if "historical_measurement_timestamp" in run_meta:
+        values["historical_measurement_timestamp"] = _naive_utc(
+            run_meta["historical_measurement_timestamp"]
+        )
+    if "replay_timestamp" in run_meta:
+        values["replay_timestamp"] = _naive_utc(run_meta["replay_timestamp"])
     columns = list(values)
     absent = _absent_columns(client, "benchmark_runs", _BENCHMARK_RUN_OPTIONAL_COLUMNS)
     if absent:
@@ -944,10 +1123,18 @@ def parse_test_xml(xml_path: Path):
 
     # One row per exact (classname, name); a repeat is a re-run, so the last attempt wins
     # and the earlier attempts are kept only as its result.reruns count.
+    testcases = suite.findall(".//testcase")
+    names = error_case_names(
+        (
+            (tc.get("classname", ""), tc.get("name", ""), classify_testcase(tc)[0])
+            for tc in testcases
+        ),
+        xml_path.stem,
+    )
     by_key: dict = {}
     seen: Counter = Counter()
-    for tc in suite.findall(".//testcase"):
-        key = (tc.get("classname", ""), tc.get("name", ""))
+    for tc, name in zip(testcases, names):
+        key = (tc.get("classname", ""), name)
         by_key[key] = tc
         seen[key] += 1
     raw_cases = []
@@ -956,14 +1143,12 @@ def parse_test_xml(xml_path: Path):
         properties = extract_properties(tc)
         if seen[key] > 1:
             properties = [*properties, ("result.reruns", str(seen[key] - 1))]
-        op_name, dtype, platform = extract_op_dtype_platform(
-            tc.get("name", ""), properties
-        )
+        op_name, dtype, platform = extract_op_dtype_platform(key[1], properties)
         raw_cases.append(
             {
                 "case_id": str(uuid.uuid4()),
-                "classname": tc.get("classname", ""),
-                "name": tc.get("name", ""),
+                "classname": key[0],
+                "name": key[1],
                 "op_name": op_name,
                 "dtype": dtype,
                 "platform": platform,
@@ -1257,6 +1442,47 @@ def _leg_state(failed: int, total: int) -> str:
     return "failed" if failed > 0 else "passed"
 
 
+def _leg_failure(state: str, acc: dict, result_props: dict) -> dict:
+    """The failure_* props the cases themselves explain, ranked as a default (confidence 1) so a
+    later collector's reason still wins. Any caller-given failure_* replaces all of them."""
+    if any(k.startswith("failure_") for k in result_props):
+        return {}
+    if state == "failed":
+        first = acc.get("first_failure", "")
+        return {
+            "failure_reason": "test_failure",
+            "failure_detail": f"{acc['failed']} of {acc['total']} failed"
+            + (f": {first}" if first else ""),
+            "failure_confidence": "1",
+        }
+    if state == "error":
+        return {
+            "failure_reason": "ingest_error",
+            "failure_subreason": "no_cases",
+            "failure_detail": "the leg reported no test cases",
+            "failure_confidence": "1",
+        }
+    return {}
+
+
+def _first_failure(acc: dict, cases: list) -> None:
+    """Remember the leg's first failing case, as `name: first message line`; a capability case
+    is named by its capability.name. Nothing is stored for a case that names nothing."""
+    if acc.get("first_failure"):
+        return
+    for case in cases:
+        if case.get("status") not in ("failed", "error"):
+            continue
+        name = case.get("name") or dict(case.get("properties") or []).get(
+            "capability.name", ""
+        )
+        line = (case.get("fail_message") or "").strip().splitlines()
+        text = name + (f": {line[0]}" if line else "")
+        if text:
+            acc["first_failure"] = text
+            return
+
+
 def _opt(args, name: str):
     """An optional flag's value; '' when the caller built `args` without it (tests do)."""
     return getattr(args, name, "") or ""
@@ -1323,13 +1549,33 @@ def _admitted_legs(legs: dict):
 def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
     """Register what the leg ran (and tag it), then its verdicts."""
     run_url = _opt(args, "run_url") or _gha_run_url(args)
-    source = "jenkins" if _opt(args, "jenkins_run_key") else "gha"
+    result_props = dict(_opt(args, "result_props") or [])
+    source = result_props.pop("source", "") or (
+        "jenkins" if _opt(args, "jenkins_run_key") else "gha"
+    )
     spec = artifact_spec(args)
     admitted = list(_admitted_legs(legs))
+    if _opt(args, "capability_legs_only"):
+        # The leg's own tier is another writer's (the orchestrator's) on the same run_id.
+        own = _opt(args, "trigger_type").strip()
+        admitted = [
+            a
+            for a in admitted
+            if a[1] in schema_model.CAPABILITY_TYPE_VALUES and a[1] != own
+        ]
+        if not admitted:
+            return True
     if not (admitted or _opt(args, "artifact")):
         # A GHA delta exists only through its verdicts; a named artifact is tagged regardless.
         return True
     options = artifact_options(args)
+    options["tags"] += ci_tags(
+        *(
+            _opt(args, k)
+            for k in ("ci_event", "repository", "branch", "sha", "pr_number")
+        ),
+        day=_opt(args, "tag_date"),
+    )
     # A bad tag (or tag family) costs only itself, never the other tags or the verdicts.
     kept, args.misc_tags = [], []
     for tag in options["tags"]:
@@ -1373,8 +1619,7 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
         )
         return False
     if r.dry_run:
-        print(f"  v2: dry run -- {r.artifact_id} [{r.source}], nothing written")
-        return True
+        print(f"  v2: dry run -- {r.artifact_id} [{r.source}]")
     identity = r.identity
     aid = identity.artifact_id
     recorded = True
@@ -1389,7 +1634,12 @@ def _write_named_artifact_verdicts(client, v2db: str, args, legs: dict) -> bool:
             state=state,
             arch=args.arch,
             duration_s=acc["duration_s"],
-            props={"run_url": run_url, "source": source},
+            props={
+                **_leg_failure(state, acc, result_props),
+                **result_props,
+                "run_url": run_url,
+                "source": source,
+            },
             attempt=getattr(args, "run_attempt", 0),
         ):
             print(
@@ -1409,7 +1659,8 @@ def _gha_run_url(args) -> str:
     return f"{server}/{repo}/actions/runs/{rid}"
 
 
-def main(argv=None):
+def build_parser() -> argparse.ArgumentParser:
+    """`results`' flags, the offline bundle ones included (offline.add_offline_options)."""
     parser = argparse.ArgumentParser(prog="spyre_clickhouse_ingest results")
     parser.add_argument("--xml-dir", default=None)
     parser.add_argument("--xml-file", default=None)
@@ -1442,6 +1693,19 @@ def main(argv=None):
     parser.add_argument("--triggered-at", default="")
     parser.add_argument("--pr-number", default="")
     parser.add_argument(
+        "--capability-legs-only",
+        action="store_true",
+        help="Write only the capability-typed artifact_results legs (model_ops, ...) other than "
+        "--trigger-type's: for a Jenkins leg whose own verdict the orchestrator writes under "
+        "the same run_id.",
+    )
+    parser.add_argument(
+        "--ci-event",
+        default="",
+        help="The CI event that built the leg's artifact (push | pull_request | schedule | ...); "
+        "tags it as options.ci_tags() spells, beside any --tag.",
+    )
+    parser.add_argument(
         "--jenkins-run-key",
         default="",
         help="This leg's own Jenkins externalizable id, e.g. 'Spyre/component-build#417'. "
@@ -1463,10 +1727,38 @@ def main(argv=None):
         arch_required=False,
     )
     parser.add_argument(
+        "--result-prop",
+        dest="result_props",
+        action="append",
+        type=pair,
+        default=[],
+        help="artifact_results prop k=v, repeatable; `source` replaces the jenkins/gha default",
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="exit 1 when --artifact/--artifact-id named an artifact but its verdicts were not "
         "all recorded; by default that is a warning and the cases still land",
+    )
+    # Backfill/replay — deliberate replays only. Forward nightlies leave these unset so
+    # Run Evidence shows Unavailable. Never rewrite created_at.
+    parser.add_argument(
+        "--is-backfill",
+        action="store_true",
+        help="Mark this ingest as a deliberate historical replay (Is backfill).",
+    )
+    parser.add_argument(
+        "--historical-measurement",
+        default=None,
+        help="UTC calendar day YYYY-MM-DD being filled (Historical measurement). "
+        "Not created_at. Omit on forward nightlies; blank/whitespace is rejected.",
+    )
+    parser.add_argument(
+        "--replay-timestamp",
+        default=None,
+        help="Wall-clock ISO-8601 UTC when the replay/ingest ran (Replay timestamp). "
+        "Must include a time (e.g. 2026-10-07T15:30:00Z); date-only is rejected. "
+        "Omit on forward nightlies; blank/whitespace is rejected.",
     )
     # Which schema generation to write. Defaults to v1 ONLY, so an un-updated caller keeps
     # behaving exactly as before -- this script runs from inside a BAKED image, so old images
@@ -1485,7 +1777,41 @@ def main(argv=None):
         "replacement tables only), or both (the migration window). Also settable via "
         "INGEST_SCHEMA so a workflow can set it once for every leg.",
     )
-    args = parser.parse_args(argv)
+    add_offline_options(parser)
+    return parser
+
+
+def _ingest_kind(argv, args) -> int:
+    """vllm, sendnn and benchmarks, connected: the bundle `--offline` would write, recorded as
+    the relay records it, so a direct run and an uploaded bundle leave the same v2 rows."""
+    from spyre_clickhouse_ingest import bundle, offline
+
+    off, _ = offline.parser().parse_known_args(argv)
+    with tempfile.TemporaryDirectory(prefix="results-") as tmp:
+        off.out = str(Path(tmp) / "bundle")
+        try:
+            args.from_bundle = str(offline.write(off))
+        except offline.BundleError as err:
+            print(json.dumps({"status": offline.STATUS[err.code], "reason": str(err)}))
+            return err.code
+        return bundle.ingest(args)
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.offline or args.validate_only or args.upload:
+        return offline_main(argv)
+    if args.from_bundle:
+        from spyre_clickhouse_ingest.bundle import ingest
+
+        return ingest(args)
+    if (
+        args.kind != "junit"
+        or args.vllm_results_dir
+        or args.sendnn_report
+        or args.benchmarks_dir
+    ):
+        return _ingest_kind(argv, args)
     args.arch = args.arch or _platform.machine() or ""
     args.platform = args.arch
     # Resolved once here rather than re-tested at each call site, so the two paths cannot
@@ -1493,6 +1819,19 @@ def main(argv=None):
     args.write_v1 = args.schema in ("v1", "both")
     args.write_v2 = args.schema in ("v2", "both")
     print(f"  schema={args.schema} (v1={args.write_v1} v2={args.write_v2})")
+
+    # Validate backfill CLI once before any connect / XML write. Invalid values must
+    # fail even when the dir has only test-result XML, and must not let a preceding
+    # junit file commit first.
+    try:
+        backfill_meta = build_backfill_meta(
+            is_backfill=args.is_backfill,
+            historical_measurement=args.historical_measurement,
+            replay_timestamp=args.replay_timestamp,
+        )
+    except ValueError as e:
+        print(f"  [error] backfill args: {e}", file=sys.stderr)
+        sys.exit(2)
 
     if args.xml_file:
         xml_files = [Path(args.xml_file)]
@@ -1512,6 +1851,10 @@ def main(argv=None):
         f"{os.environ['CLICKHOUSE_HOST']}:{os.environ.get('CLICKHOUSE_PORT', '443')} ..."
     )
     client = get_client()
+    if args.dry_run:
+        # Every write below goes through this one client, so none reaches the database.
+        client = DryRunClient(client)
+        print("  dry run: reads only, nothing is written")
     # One client, both generations: v2 is reached by QUALIFYING every statement with this
     # database name (see target_database). "" means v2 is not configured, which every v2 site
     # treats as "skip".
@@ -1531,6 +1874,15 @@ def main(argv=None):
     # was going to write. Both columns have been live on prod for months, and the v2 tables
     # have neither and need neither. Schema changes belong in the DDL, not in the writer;
     # _absent_columns() below already degrades gracefully if a column really is missing.
+
+    # Deliberate backfill must not soft-drop columns then insert: source_file dedup would
+    # block a post-migration retry. Fail before any XML write when columns are absent.
+    if backfill_meta and args.write_v1:
+        try:
+            require_backfill_columns(client, backfill_meta)
+        except BackfillSchemaIncomplete as e:
+            print(f"  [error] {e}", file=sys.stderr)
+            sys.exit(2)
 
     total_cases = 0
     total_benchmarks = 0
@@ -1580,6 +1932,7 @@ def main(argv=None):
             )
             if run_meta is None:
                 continue
+            apply_backfill_meta(run_meta, backfill_meta)
 
             # v1-table read, so it only applies when v1 is being written. The v2 path has its
             # own dedup (benchmarks_already_ingested) against its own table.
@@ -1649,6 +2002,7 @@ def main(argv=None):
             )
             if run_meta is None:
                 continue
+            apply_backfill_meta(run_meta, backfill_meta)
 
             # A perf run uploads report.xml alongside the spyre/cpu kernel-report
             # XMLs. Those kernel reports are benchmark XMLs (classname carries
@@ -1856,6 +2210,7 @@ def main(argv=None):
                         _acc["failed"] += int(run.get("failed", 0) or 0)
                         _acc["total"] += int(run.get("total_tests", 0) or 0)
                         _acc["duration_s"] += float(run.get("duration_s", 0) or 0)
+                        _first_failure(_acc, cases)
                         _capability_legs(artifact_legs, _v2_run_id, cases)
             except Exception as _v2_err:
                 v2_failed_files.append(xml_path.name)
@@ -1887,6 +2242,8 @@ def main(argv=None):
             f"  [warn] v2 write FAILED for {len(v2_failed_files)} file(s): "
             + ", ".join(v2_failed_files)
         )
+    if args.dry_run:
+        print("  dry run -- nothing written; would write:\n" + client.report())
     if args.strict and not verdicts_recorded:
         print(
             "  [error] v2: --strict, and the artifact's verdicts were not all recorded"
